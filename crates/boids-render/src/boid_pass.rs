@@ -40,11 +40,7 @@ impl BoidPass {
     /// # Panics
     /// Panics if the shader fails to compile, which is a programming error and belongs at startup.
     #[must_use]
-    pub fn new(
-        ctx: &boids_gpu::context::GpuContext,
-        scene: &SceneLayout,
-        format: wgpu::TextureFormat,
-    ) -> Self {
+    pub fn new(ctx: &boids_gpu::context::GpuContext, scene: &SceneLayout) -> Self {
         let pipeline_layout = ctx
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -69,7 +65,9 @@ impl BoidPass {
                     entry_point: Some("fs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format,
+                        // The HDR scene target: a bioluminescent fish is an additive light above
+                        // 1.0, and the bloom pass needs that value rather than a clipped white.
+                        format: crate::targets::HDR_FORMAT,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -85,9 +83,10 @@ impl BoidPass {
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
                     depth_write_enabled: Some(true),
-                    // `GreaterEqual` would be the choice for a reversed-Z setup, which is worth
-                    // switching to when the underwater raymarch starts writing real distances: it
-                    // distributes precision far better across a scene spanning metres to kilometres.
+                    // Against the environment's own distances now: the ocean pass writes the reef's
+                    // real hit depth, so an agent behind a column is rejected by the same test that
+                    // rejects it behind another agent. See `post.rs`'s sibling `ocean.rs` for why the
+                    // environment writes depth by hand rather than rasterising geometry.
                     depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),

@@ -30,6 +30,7 @@ mod grid;
 mod immediates;
 mod layout;
 mod reference;
+mod sdf;
 mod shaders;
 
 use std::time::Instant;
@@ -129,6 +130,7 @@ fn cases() -> Vec<NamedCheck> {
             "layout/struct_sizes_are_exact",
             layout::struct_sizes_are_exact,
         ),
+        ("sdf/wgsl_matches_rust", sdf::wgsl_matches_rust),
         (
             "reference/one_step_matches_cpu",
             reference::one_step_matches_cpu,

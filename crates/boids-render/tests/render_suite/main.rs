@@ -13,6 +13,14 @@
 //! * `depth_is_written` - geometry survived the depth test and is within the world's distance range,
 //!   which catches a wrong winding, a wrong compare function, and a camera pointed the wrong way.
 //! * `worlds_look_different` - the mode reaches the shaders, which catches a stale scene uniform.
+//! * `ocean_writes_depth` - the underwater raymarch found geometry and reported its distance, which
+//!   catches a march that never hits, a wrong `frag_depth`, and a surface plane in the wrong place.
+//! * `underwater_is_blue_and_lit` - the frame is neither black nor grey: the medium scatters light and
+//!   water extinguishes red before blue, which is the one property that makes it read as water.
+//! * `bloom_adds_light` - the pyramid contributes light to the composite, which catches a bright pass
+//!   that thresholds everything away, a pyramid that never gets read, and a composite that ignores it.
+//! * `focus_marker_is_visible` - the cursor's influence point is drawn, which catches the marker being
+//!   culled by the environment depth or the interaction uniform never reaching the shader.
 //!
 //! Run as a hand-rolled main: the device must be created and dropped on the main thread, for the reason
 //! documented in `boids-gpu/tests/gpu/main.rs`.
@@ -23,7 +31,7 @@ use std::time::Instant;
 
 use boids_core::config::SimConfig;
 use boids_core::camera::OrbitCamera;
-use boids_core::layout::{SceneUniform, SimMode};
+use boids_core::layout::{InteractionMode, InteractionUniforms, PostParams, SceneUniform, SimMode, WaterParams};
 use boids_gpu::context::GpuContext;
 use boids_gpu::sim::{SimPipelines, SimResources, Strategy};
 use boids_render::renderer::{FrameInput, Renderer};
@@ -72,6 +80,10 @@ fn main() {
         ("agents_contribute_pixels", agents_contribute_pixels),
         ("depth_is_written", depth_is_written),
         ("worlds_look_different", worlds_look_different),
+        ("ocean_writes_depth", ocean_writes_depth),
+        ("underwater_is_blue_and_lit", underwater_is_blue_and_lit),
+        ("bloom_adds_light", bloom_adds_light),
+        ("focus_marker_is_visible", focus_marker_is_visible),
     ];
 
     let mut passed = 0usize;
@@ -131,8 +143,10 @@ impl Captured {
     /// Pixels where the two frames differ by more than `threshold` in any channel.
     fn differing_pixels(&self, other: &Self, threshold: u8) -> usize {
         self.color
-            .chunks_exact(4)
-            .zip(other.color.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(other.color.as_chunks::<4>().0.iter())
             .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > threshold))
             .count()
     }
@@ -175,6 +189,21 @@ impl Captured {
             .all(|d| (0.0..1.0).contains(d))
     }
 
+    /// Every written depth sample, converted back to metres from the camera.
+    ///
+    /// The attachment holds NDC depth, which is `far / (far - near) * (1 - near / d)` for a
+    /// `directx`-convention projection. Reading it as a distance is what makes an assertion about the
+    /// environment's *relief* meaningful: in NDC, a seafloor at 150 m and a surface at 200 m differ in
+    /// the fourth decimal place, so a threshold on the raw values would either be vacuous or
+    /// arbitrary.
+    fn depth_metres(&self, near: f32, far: f32) -> Vec<f32> {
+        self.depth()
+            .iter()
+            .filter(|z| **z < 0.999_9)
+            .map(|z| near * far / (far - z * (far - near)))
+            .collect()
+    }
+
     /// The closest written depth sample.
     fn depth_nearest(&self) -> f32 {
         self.depth()
@@ -196,6 +225,10 @@ struct Harness<'a> {
     camera: OrbitCamera,
     color: wgpu::Texture,
     depth: wgpu::Texture,
+    water: WaterParams,
+    post: PostParams,
+    /// Cursor state for the next capture. Checks that do not care leave it idle.
+    interaction: InteractionUniforms,
 }
 
 impl<'a> Harness<'a> {
@@ -265,6 +298,9 @@ impl<'a> Harness<'a> {
             sim,
             pipes,
             renderer,
+            water: boids_scene::water_params(&config),
+            post: boids_scene::post_params(config.mode, 0.5),
+            interaction: SimConfig::idle_interaction(),
             config,
             camera,
             color,
@@ -275,9 +311,9 @@ impl<'a> Harness<'a> {
     /// Advances the swarm by `steps`, then draws a frame and reads both attachments back.
     fn capture(&mut self, steps: usize, agents: u32) -> Captured {
         let params = self.config.to_params(0.5, self.config.dt);
-        let interaction = SimConfig::idle_interaction();
         self.sim.write_params(&self.ctx.queue, &params);
-        self.sim.write_interaction(&self.ctx.queue, &interaction);
+        self.sim
+            .write_interaction(&self.ctx.queue, &self.interaction);
 
         let mut encoder = self
             .ctx
@@ -309,6 +345,10 @@ impl<'a> Harness<'a> {
             FrameInput {
                 binding: SceneBinding::new(self.sim.read_index()),
                 num_agents: agents,
+                world: self.config.mode,
+                water: self.water,
+                interaction: self.interaction,
+                post: self.post,
             },
         );
 
@@ -589,5 +629,193 @@ fn worlds_look_different(ctx: &GpuContext) -> CheckResult {
         ));
     }
     println!("\n    {:.1}% of pixels differ between sky and sea", fraction * 100.0);
+    Ok(Outcome::Pass)
+}
+
+
+// -------------------------------------------------------------------------------------------
+// HDR pass checks
+// -------------------------------------------------------------------------------------------
+
+/// The underwater environment has to produce real distances into the depth attachment.
+///
+/// This is what makes the fish occlude against the reef at all: the pass writes depth by hand from the
+/// raymarched hit, so a march that never hits anything, a `frag_depth` that is not in [0, 1], or a
+/// surface plane below the camera all show up here rather than as agents floating in front of rock.
+fn ocean_writes_depth(ctx: &GpuContext) -> CheckResult {
+    if !supports_depth_copy(ctx) {
+        return Ok(Outcome::Skipped(format!(
+            "backend {:?} cannot copy depth to a buffer, so the raymarch's distance cannot be \
+             inspected. The pass is still exercised: its output is what `underwater_is_blue_and_lit` \
+             reads from the colour target.",
+            ctx.info.backend
+        )));
+    }
+
+    let mut harness = Harness::new(ctx, SimMode::Fish, 1500);
+    // Looking down at the seafloor from above the reef: the column here is short, so the whole frame
+    // must be either rock or water, and both are at finite distances.
+    harness.camera.pitch = 0.45;
+    let frame = harness.capture(20, 1500);
+
+    let coverage = frame.depth_coverage();
+    if coverage < 0.5 {
+        return Err(format!(
+            "only {:.1}% of the frame has a distance written by the ocean raymarch. The march is \
+             probably stepping past the seafloor (check the maximum step against the depth of the \
+             world) or `frag_depth` is being left at the far plane.",
+            coverage * 100.0
+        ));
+    }
+    if !frame.depth_is_plausible() {
+        return Err(
+            "the ocean wrote depth outside [0, 1), which means the clip-space conversion in \
+             render/ocean.wgsl is wrong rather than the march"
+                .to_string(),
+        );
+    }
+
+    // And the distances must have real relief: a single constant distance would mean every ray hit
+    // the same plane (a broken surface test, for instance), which a coverage check alone would pass.
+    let distances = frame.depth_metres(harness.camera.near, harness.camera.far);
+    let nearest = distances.iter().copied().fold(f32::INFINITY, f32::min);
+    let furthest = distances.iter().copied().fold(0.0, f32::max);
+    let spread = furthest - nearest;
+    if spread < 1.0 {
+        return Err(format!(
+            "every raymarched distance is between {nearest:.1} m and {furthest:.1} m, so the \
+             environment has no relief in the frame. Check that the reef field is evaluated rather \
+             than the seafloor plane alone."
+        ));
+    }
+
+    println!(
+        "\n    ocean depth coverage {:.1}%, distances {nearest:.0}..{furthest:.0} m",
+        coverage * 100.0
+    );
+    Ok(Outcome::Pass)
+}
+
+/// The underwater frame must be lit and blue-dominant.
+///
+/// Two properties in one check because they fail for the same reason - the medium model - and because
+/// a frame that is black satisfies "blue-dominant" vacuously while a frame that is grey does not mean
+/// the extinction is running per channel. Blue surviving longer than red is the entire visual
+/// signature of water, and it is the one thing a single-coefficient fog cannot express.
+fn underwater_is_blue_and_lit(ctx: &GpuContext) -> CheckResult {
+    let mut harness = Harness::new(ctx, SimMode::Fish, 3000);
+    let frame = harness.capture(30, 3000);
+
+    let mut sum = [0u64; 3];
+    for px in frame.color.as_chunks::<4>().0 {
+        for c in 0..3 {
+            sum[c] += u64::from(px[c]);
+        }
+    }
+    let total = (WIDTH * HEIGHT) as f64;
+    let mean = [
+        sum[0] as f64 / total,
+        sum[1] as f64 / total,
+        sum[2] as f64 / total,
+    ];
+
+    if mean[2] < 4.0 {
+        return Err(format!(
+            "the underwater frame is essentially black (mean blue {:.2}); the medium scatters no \
+             light. Check `WaterParams::scatter`, the exposure in `boids_scene::post_params`, and \
+             whether the ocean pass's colour reaches the composite.",
+            mean[2]
+        ));
+    }
+    if mean[2] <= mean[0] {
+        return Err(format!(
+            "the underwater frame is not blue-dominant (mean RGB {mean:.2?}). Water must extinguish \
+             red before blue: check the per-channel extinction in `boids_scene::water_params` and \
+             that `render/water.wgsl` is the model the agents and the medium both use."
+        ));
+    }
+
+    println!(
+        "\n    underwater mean RGB {:.1}/{:.1}/{:.1}",
+        mean[0], mean[1], mean[2]
+    );
+    Ok(Outcome::Pass)
+}
+
+/// Bloom has to add light to the composite.
+///
+/// The comparison is deliberately between two frames of the *same* scene with only `bloom_strength`
+/// changed: any difference is the pyramid's contribution, so the check cannot pass because the scene
+/// got brighter for an unrelated reason.
+fn bloom_adds_light(ctx: &GpuContext) -> CheckResult {
+    let mut with = Harness::new(ctx, SimMode::Fish, 2000);
+    with.post.bloom_strength = 1.2;
+    let with_bloom = with.capture(30, 2000);
+
+    let mut without = Harness::new(ctx, SimMode::Fish, 2000);
+    without.post.bloom_strength = 0.0;
+    let without_bloom = without.capture(30, 2000);
+
+    let sum = |frame: &Captured| -> u64 {
+        frame
+            .color
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| u64::from(px[0]) + u64::from(px[1]) + u64::from(px[2]))
+            .sum()
+    };
+    let a = sum(&with_bloom);
+    let b = sum(&without_bloom);
+    if b == 0 {
+        return Err("the frame without bloom is completely black; nothing to compare".to_string());
+    }
+    let gain = (a as f64 - b as f64) / b as f64;
+    if gain < 0.005 {
+        return Err(format!(
+            "enabling bloom changed the frame by only {:.3}%; the pyramid contributes nothing. \
+             Check the bright pass's threshold against the scene's actual HDR range (a threshold \
+             above every pixel empties the pyramid), and that the composite samples level 0.",
+            gain * 100.0
+        ));
+    }
+    println!("\n    bloom raised total luma by {:.2}%", gain * 100.0);
+    Ok(Outcome::Pass)
+}
+
+/// The cursor's influence point has to be visible where it is.
+///
+/// The marker is drawn analytically in the environment shaders rather than as geometry, which means a
+/// broken interaction uniform, a marker placed behind the reef's depth, or a wrong ray reconstruction
+/// would leave the frame identical. Comparing the idle frame against one with an active attractor over
+/// the centre of the view isolates exactly that.
+fn focus_marker_is_visible(ctx: &GpuContext) -> CheckResult {
+    let mut idle = Harness::new(ctx, SimMode::Fish, 1000);
+    let without = idle.capture(10, 1000);
+
+    let mut active = Harness::new(ctx, SimMode::Fish, 1000);
+    let focus = active.camera.target;
+    active.interaction = InteractionUniforms {
+        ray_origin: active.camera.eye().to_array(),
+        mode: InteractionMode::Attract.as_u32(),
+        focus_point: focus.to_array(),
+        radius: active.config.r_percept * 6.0,
+        strength: 10.0,
+        falloff: 1.6,
+        tangent: 0.0,
+        _pad: 0.0,
+    };
+    let with = active.capture(10, 1000);
+
+    let differing = with.differing_pixels(&without, 8);
+    if differing < 8 {
+        return Err(format!(
+            "only {differing} pixels changed when the cursor attractor was placed at the centre of \
+             the frame; the focus marker is not being drawn. Check that `render/water.wgsl`'s \
+             `focus_marker` is called by the ocean pass, that the interaction uniform reaches \
+             `SceneLayout`, and that the marker is not behind the environment's depth."
+        ));
+    }
+    println!("\n    focus marker changed {differing} pixels");
     Ok(Outcome::Pass)
 }

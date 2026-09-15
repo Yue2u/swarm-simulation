@@ -170,6 +170,48 @@ struct SortParams {
     pad: u32,
 }
 
+// Underwater medium and reef geometry, read by the ocean raymarch pass. Mirrors `WaterParams` in
+// `crates/boids-core/src/layout.rs`, field for field; the `layout_probe` test on the device fails if
+// the two disagree. Twelve scalars, so no member needs padding.
+struct WaterParams {
+    // 0
+    surface_y: f32,
+    floor_y: f32,
+    reef_period: f32,
+    caustic_strength: f32,
+    // 16
+    // Per-channel extinction, metres^-1. Red is absorbed within metres, blue survives tens of them:
+    // that ratio is what makes depth read as depth instead of as darkness.
+    extinction: vec3<f32>,
+    scatter: f32,
+    // 32
+    godray_strength: f32,
+    surface_glow: f32,
+    caustic_scale: f32,
+    caustic_drift: f32,
+    // 48 == size
+}
+
+// HDR post-processing parameters, read by the bloom and composite passes. Mirrors `PostParams`.
+struct PostParams {
+    // 0
+    exposure: f32,
+    bloom_threshold: f32,
+    bloom_knee: f32,
+    bloom_strength: f32,
+    // 16
+    vignette: f32,
+    grain: f32,
+    aberration: f32,
+    tonemap_white: f32,
+    // 32
+    time: f32,
+    saturation: f32,
+    contrast: f32,
+    lift: f32,
+    // 48 == size
+}
+
 // Sentinel stored in `cell_start` for a cell that contains no boids.
 const EMPTY_CELL: u32 = 0xFFFFFFFFu;
 
@@ -179,3 +221,10 @@ const MODE_BIRDS: u32 = 1u;
 const INTERACTION_OFF: u32 = 0u;
 const INTERACTION_ATTRACT: u32 = 1u;
 const INTERACTION_REPEL: u32 = 2u;
+
+// Which avoidance field the environment exposes, mirroring `EnvironmentKind` on the host. Declared
+// here rather than in `sim/forces.wgsl` because the render passes need the same selectors: the rock
+// the fish steer around and the rock the camera sees have to be the same rock.
+const ENV_NONE: u32 = 0u;
+const ENV_REEF: u32 = 1u;
+const ENV_TERRAIN: u32 = 2u;

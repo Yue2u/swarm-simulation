@@ -92,11 +92,6 @@ fn neighbour_force(acc: NeighbourAccum, pos: vec3<f32>, vel: vec3<f32>) -> vec3<
 // Environment and world forces
 // ---------------------------------------------------------------------------------------------
 
-// Which environment field to query. Mirrors `boids_core::EnvironmentKind`.
-const ENV_NONE: u32 = 0u;
-const ENV_REEF: u32 = 1u;
-const ENV_TERRAIN: u32 = 2u;
-
 // SDF avoidance, including the forward probe that produces tangential sliding.
 //
 // The probe is what makes agents *go around* a rock instead of pressing into it. A pure repulsion

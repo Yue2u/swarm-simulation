@@ -9,7 +9,7 @@
 //! Sign convention: **negative inside** the solid, positive outside, magnitude approximately the
 //! distance to the surface.
 
-use glam::{Vec3, Vec3Swizzles};
+use glam::{Vec2, Vec3, Vec3Swizzles};
 
 use crate::math::smoothstep;
 
@@ -75,25 +75,45 @@ pub fn column_radius_profile(t: f32, base_radius: f32, taper: f32) -> f32 {
     base_radius * (1.0 - taper * t * t) * (1.0 + 0.12 * (t * 9.0).sin())
 }
 
-/// The reef field: a domain-repeated family of tapered columns plus a seafloor.
+/// The reef field: two domain-repeated families of tapered columns plus a seafloor.
 ///
 /// `period` is the repetition spacing in `xz`. Domain repetition is what keeps the field cheap:
 /// the same handful of arithmetic operations describe an unbounded reef.
+///
+/// The second family, offset by half a period, is what fills the gaps of the first and gives the
+/// reef its arches without a separate primitive. Both blend radii and the family parameters must
+/// match `reef_field` in `shaders/common/sdf.wgsl` exactly; `sdf_wgsl_matches_rust` compares the two
+/// on a grid.
 #[inline]
 #[must_use]
 pub fn reef_field(p: Vec3, period: f32, seafloor_y: f32) -> f32 {
     let cell = (p.xz() / period).floor();
     // Hash the cell to vary radius and height per column without a texture lookup.
     let h = hash2(cell);
-    let center = (cell + Vec3::splat(0.5).xz()) * period;
+    let center = (cell + Vec2::splat(0.5)) * period;
     let height = 20.0 + 26.0 * h;
-    let radius = 3.0 + 3.5 * hash2(cell + Vec3::splat(17.0).xz());
+    let radius = 3.0 + 3.5 * hash2(cell + Vec2::splat(17.0));
     let base = seafloor_y;
     let top = seafloor_y + height;
     let t = ((p.y - base) / (top - base)).clamp(0.0, 1.0);
     let r = column_radius_profile(t, radius, 0.45);
-    let c = column(p, center, r, base, top);
-    smin(c, plane_y(p, seafloor_y), 4.0)
+    let a = column(p, center, r, base, top);
+
+    let center2 = center + Vec2::new(0.55 * period, 0.1 * period);
+    let height2 = 12.0 + 30.0 * hash2(cell + Vec2::new(5.0, 9.0));
+    let r2 = 2.0 + 3.0 * hash2(cell + Vec2::new(31.0, 3.0));
+    let t2 = ((p.y - base) / height2).clamp(0.0, 1.0);
+    let b = column(
+        p,
+        center2,
+        column_radius_profile(t2, r2, 0.5),
+        base,
+        base + height2,
+    );
+
+    let columns = smin(a, b, 3.0);
+    // The floor uses a larger blend radius so columns visibly grow out of it.
+    smin(columns, plane_y(p, seafloor_y), 6.0)
 }
 
 /// Cell-coordinate hash in `[0, 1)`, matching `hash21` in `shaders/common/sdf.wgsl`.

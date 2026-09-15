@@ -2,13 +2,14 @@
 // Device-side probe of the CPU/WGSL struct layout contract.
 //
 // bindings: @group(0) 0:boid_in(read) 1:params_in(read) 2:interaction_in(read) 3:values_out(rw)
+//                     4:water_in(read) 5:post_in(read)
 // workgroup: 1 x 1 x 1
 // dispatch:  1
 //
 // HOW THE TEST WORKS
-//   The host fills `boid_in`, `params_in` and `interaction_in` with a byte ramp: byte offset 4k
-//   holds the f32 value `k + 1`. It then dispatches this shader on a 1x1x1 workgroup and reads back
-//   `values_out`.
+//   The host fills `boid_in`, `params_in`, `interaction_in`, `water_in` and `post_in` with a byte
+//   ramp: byte offset 4k holds the f32 value `k + 1`. It then dispatches this shader on a 1x1x1
+//   workgroup and reads back `values_out`.
 //
 //   This shader copies each struct field, in declaration order, into `values_out`. If the WGSL
 //   member offsets match the Rust `offset_of!` offsets, then `values_out[i] == offset_i / 4 + 1`.
@@ -29,9 +30,15 @@
 @group(0) @binding(1) var<storage, read> params_in: SimParams;
 @group(0) @binding(2) var<storage, read> interaction_in: InteractionUniforms;
 @group(0) @binding(3) var<storage, read_write> values_out: array<f32>;
+// The render-side uniforms are declared as storage here rather than as uniforms: the probe only
+// compares member *offsets*, and for structs made of scalars and one `vec3` the two address spaces
+// agree member for member. Binding them as uniforms would need separate hosts for each, which is
+// exactly the kind of duplication this probe exists to avoid.
+@group(0) @binding(4) var<storage, read> water_in: WaterParams;
+@group(0) @binding(5) var<storage, read> post_in: PostParams;
 
 // Number of scalar slots the probe writes. Must match PROBE_SLOTS on the host.
-const PROBE_SLOTS: u32 = 64u;
+const PROBE_SLOTS: u32 = 88u;
 
 @compute @workgroup_size(1, 1, 1)
 fn probe(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -110,6 +117,36 @@ fn probe(@builtin(global_invocation_id) gid: vec3<u32>) {
     out[57] = it.falloff;
     out[58] = it.tangent;
     out[59] = it.pad;
+
+    // --- WaterParams: 12 scalars, indices 60..72 ---
+    let w = water_in;
+    out[60] = w.surface_y;
+    out[61] = w.floor_y;
+    out[62] = w.reef_period;
+    out[63] = w.caustic_strength;
+    out[64] = w.extinction.x;
+    out[65] = w.extinction.y;
+    out[66] = w.extinction.z;
+    out[67] = w.scatter;
+    out[68] = w.godray_strength;
+    out[69] = w.surface_glow;
+    out[70] = w.caustic_scale;
+    out[71] = w.caustic_drift;
+
+    // --- PostParams: 12 scalars, indices 72..84 ---
+    let q = post_in;
+    out[72] = q.exposure;
+    out[73] = q.bloom_threshold;
+    out[74] = q.bloom_knee;
+    out[75] = q.bloom_strength;
+    out[76] = q.vignette;
+    out[77] = q.grain;
+    out[78] = q.aberration;
+    out[79] = q.tonemap_white;
+    out[80] = q.time;
+    out[81] = q.saturation;
+    out[82] = q.contrast;
+    out[83] = q.lift;
 
     for (var i = 0u; i < PROBE_SLOTS; i = i + 1u) {
         values_out[i] = out[i];

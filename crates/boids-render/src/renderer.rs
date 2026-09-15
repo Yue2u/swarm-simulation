@@ -1,54 +1,84 @@
-//! Frame orchestration: owns the render passes, the targets and the per-frame uniform upload.
+//! The frame graph: one render pass over the scene, then the HDR post chain.
 //!
-//! The renderer is deliberately the only place that knows the pass order. Passes do not call each
-//! other; each is handed an open render pass and a scene binding. That keeps the frame graph readable
-//! in one screen and makes adding a pass a matter of adding one call in [`Renderer::render`].
+//! # What one frame does
+//!
+//! ```text
+//! 1. uniforms   SceneUniform, WaterParams, InteractionUniforms, PostParams   (four write_buffer)
+//! 2. environment
+//!      underwater  render/ocean.wgsl       full-screen SDF raymarch, writes depth
+//!      sky         render/background.wgsl  full-screen gradient, no depth
+//! 3. agents     render/boid.wgsl           one instanced draw, depth tested and writing
+//! 4. bloom      bright, downsample, additive upsample into the pyramid
+//! 5. composite  aberration, exposure, ACES tone map, grade -> the target
+//! ```
+//!
+//! Steps 2 and 3 share one render pass and one depth attachment: the environment writes depth and the
+//! agents compare against it, which is what puts a fish behind a column and in front of the seafloor.
+//! Steps 4 and 5 are separate passes with no depth at all.
+//!
+//! # Why both worlds are built up front
+//!
+//! Switching worlds changes one `SimMode` and selects between two pipelines that were compiled at
+//! startup. Nothing is allocated, no pipeline is recompiled and the driver state the GPU has already
+//! warmed up stays warm, so the switch costs one frame and can be used as a live A/B comparison
+//! instead of a multi-second hitch. That is also why the post chain is shared rather than owned per
+//! world: the exposure differs, the chain does not.
 
-use boids_core::layout::SceneUniform;
+use boids_core::layout::{InteractionUniforms, PostParams, SceneUniform, WaterParams};
+use boids_core::layout::SimMode;
 use boids_gpu::context::GpuContext;
 
 use crate::background::BackgroundPass;
 use crate::boid_pass::BoidPass;
+use crate::ocean::OceanPass;
+use crate::post::PostChain;
 use crate::scene::{SceneBinding, SceneLayout};
 use crate::targets::FrameTargets;
 
-/// What the renderer needs to know about the simulation's buffer parity this frame.
+/// What the renderer needs to know about this frame that is not in the scene uniform.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameInput {
-    /// Which agent buffer holds the state to draw.
+    /// Which agent buffer parity to draw, i.e. what the last simulation step wrote.
     pub binding: SceneBinding,
-    /// Number of live agents.
+    /// Number of live agents, so the instanced draw can be sized without reading a uniform.
     pub num_agents: u32,
+    /// Which world's environment to draw.
+    pub world: SimMode,
+    /// Underwater medium and reef geometry.
+    pub water: WaterParams,
+    /// Cursor interaction state, for the focus marker.
+    pub interaction: InteractionUniforms,
+    /// Post-processing parameters.
+    pub post: PostParams,
 }
 
-/// Counters the app shows in the HUD. Cheap to produce and the fastest way to notice that a pass
-/// started doing something it should not.
-#[derive(Debug, Clone, Copy, Default)]
+/// Draw calls, instances and triangles recorded for one frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameStats {
-    /// Draw calls recorded this frame.
+    /// Explicit draw calls recorded.
     pub draw_calls: u32,
-    /// Instances submitted (one per agent).
-    pub instances: u32,
-    /// Triangles submitted.
+    /// Instance count submitted to the agent draw.
+    pub instances: u64,
+    /// Triangles submitted to the agent draw.
     pub triangles: u64,
 }
 
-/// The whole presentation side of the frame.
+/// The frame renderer for both worlds.
 #[derive(Debug)]
 pub struct Renderer {
     targets: FrameTargets,
     scene: SceneLayout,
     background: BackgroundPass,
+    ocean: OceanPass,
     boids: BoidPass,
+    post: PostChain,
     format: wgpu::TextureFormat,
-    /// Whether the swapchain format is sRGB, i.e. whether the hardware applies the transfer function.
     is_srgb: bool,
-    /// Size the last frame was rendered at, for resize detection without a resize event.
     last_size: (u32, u32),
 }
 
 impl Renderer {
-    /// Builds every pipeline and allocates the depth target.
+    /// Builds every pipeline and target for a swapchain format and size.
     ///
     /// `boids` is the pair of ping-pong agent buffers. Both are bound up front; the renderer picks one
     /// per frame rather than rebuilding a bind group.
@@ -62,13 +92,34 @@ impl Renderer {
         height: u32,
     ) -> Self {
         let scene = SceneLayout::new(ctx, boids);
-        let background = BackgroundPass::new(ctx, &scene, format);
-        let boids_pass = BoidPass::new(ctx, &scene, format);
+        let targets = FrameTargets::new(&ctx.device, width, height);
+        // The sky backdrop needs the format of the *scene* target now, not the swapchain: it draws
+        // into the HDR intermediate like everything else, and the composite owns the swapchain.
+        let background = BackgroundPass::new(ctx, &scene);
+        let ocean = OceanPass::new(ctx, &scene);
+        let boids_pass = BoidPass::new(ctx, &scene);
+        let post = PostChain::new(
+            ctx,
+            format,
+            is_srgb,
+            &scene.post,
+            targets.hdr_view(),
+            width,
+            height,
+        );
+        log::info!(
+            "renderer: {}x{} swapchain {format:?} (srgb {is_srgb}), bloom {:?}",
+            width.max(1),
+            height.max(1),
+            post.bloom_size()
+        );
         Self {
-            targets: FrameTargets::new(&ctx.device, width, height),
+            targets,
             scene,
             background,
+            ocean,
             boids: boids_pass,
+            post,
             format,
             is_srgb,
             last_size: (width.max(1), height.max(1)),
@@ -100,6 +151,10 @@ impl Renderer {
                 self.targets.size.1
             );
         }
+        // The post chain is rebuilt whenever the size *or* the HDR view changed, which the chain
+        // decides for itself by comparing sizes; after a resize both have.
+        self.post
+            .resize(ctx, &self.scene.post, self.targets.hdr_view(), width, height);
         self.last_size = self.targets.size;
     }
 
@@ -109,7 +164,7 @@ impl Renderer {
         self.last_size
     }
 
-    /// Draws one frame into the renderer's own depth attachment.
+    /// Draws one frame into the renderer's own depth attachment and tonemaps into `target`.
     ///
     /// The normal path for presenting to a window.
     pub fn render(
@@ -127,10 +182,12 @@ impl Renderer {
     ///
     /// This is the real implementation; [`Renderer::render`] is the convenience wrapper around it.
     /// Taking the depth attachment as a parameter is what makes the scene reproducible off screen: the
-    /// tests draw into a colour texture and a depth texture they can read back, which is the only way
-    /// to verify that geometry was rasterised rather than merely that the code ran. The same hook is
-    /// what the HDR and bloom chain will use when the passes land, since those need the scene rendered
-    /// into an `Rgba16Float` target instead of the swapchain.
+    /// tests draw into colour and depth textures they can read back, which is the only way to verify
+    /// that geometry was rasterised rather than merely that the code ran.
+    ///
+    /// The target must have the size the renderer was built for, because the colour half of the frame
+    /// goes through the renderer's own HDR intermediate and its bloom pyramid; only the depth and the
+    /// final composited image are caller-provided.
     pub fn render_into(
         &mut self,
         ctx: &GpuContext,
@@ -139,7 +196,13 @@ impl Renderer {
         scene: &SceneUniform,
         input: FrameInput,
     ) -> FrameStats {
-        self.scene.write(&ctx.queue, scene);
+        self.scene.write(
+            &ctx.queue,
+            scene,
+            &input.water,
+            &input.interaction,
+            &input.post,
+        );
 
         let mut encoder = ctx
             .device
@@ -150,15 +213,15 @@ impl Renderer {
         let mut stats = FrameStats::default();
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frame passes"),
+                label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
+                    view: self.targets.hdr_view(),
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // The background pass covers every pixel, so loading the previous contents
-                        // would be pure bandwidth. `Clear` also means the target is valid even if the
-                        // background pass is later restricted to part of the viewport.
+                        // Both the backdrop and the ocean cover every pixel, so loading the previous
+                        // contents would be pure bandwidth. `Clear` also means the target is valid
+                        // even if a future backdrop is restricted to part of the viewport.
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
@@ -166,8 +229,10 @@ impl Renderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depth,
                     depth_ops: Some(wgpu::Operations {
-                        // Cleared to 1.0, the far plane, because the pass uses `LessEqual`: anything an
-                        // agent writes must be closer than the clear value or it would be rejected.
+                        // Cleared to 1.0, the far plane, because the agents use `LessEqual`: anything
+                        // an agent writes must be closer than the clear value or it would be rejected.
+                        // The ocean pass then overwrites this with its real hit distances, and the
+                        // agents are rejected behind rock exactly as they are behind each other.
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
                     }),
@@ -178,21 +243,27 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            // 1. Backdrop: fills the frame and establishes the horizon. Writes no depth.
-            self.background.draw(&mut pass, &self.scene, input.binding);
+            // 1. Environment. One of the two backdrops; only the underwater one writes depth.
+            match input.world {
+                SimMode::Fish => self.ocean.draw(&mut pass, &self.scene, input.binding),
+                SimMode::Birds => self.background.draw(&mut pass, &self.scene, input.binding),
+            }
             stats.draw_calls += 1;
 
-            // 2. Agents: one instanced draw for the whole swarm, depth tested against the backdrop's
-            //    far plane (and, later today, against the raymarched reef).
+            // 2. Agents: one instanced draw for the whole swarm, depth tested against whatever the
+            //    environment wrote.
             self.boids
                 .draw(&mut pass, &self.scene, input.binding, input.num_agents);
             if input.num_agents > 0 {
                 stats.draw_calls += 1;
-                stats.instances += input.num_agents;
+                stats.instances += u64::from(input.num_agents);
                 stats.triangles += u64::from(input.num_agents)
                     * u64::from(crate::boid_pass::MESH_TRIANGLES);
             }
         }
+
+        // 3. Post: bloom pyramid, then the tone map into the caller's target.
+        self.post.record(&mut encoder, target);
 
         ctx.queue.submit(Some(encoder.finish()));
         stats

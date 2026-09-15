@@ -28,7 +28,7 @@
 //   normal data in the mesh function, and cannot produce a wrong normal on a degenerate wing
 //   triangle because such a triangle has no visible pixels to shade.
 
-//#include "render/bindings.wgsl"
+//#include "render/water.wgsl"
 
 // Per-mode shape parameters, set from `boids_render::MeshProfile`.
 const VARIANT_FISH: f32 = 0.0;
@@ -254,8 +254,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Bioluminescence: fish light up, birds do not (their emissive is 0).
     color = color + in.color * in.emissive * 2.5;
 
-    let blend = medium_blend(distance);
-    color = mix(color, scene.fog_color, blend);
+    // The two worlds attenuate differently, and the difference is the point. Water absorbs per
+    // channel, so a fish 40 m away keeps its blue and loses its red: that colour shift is most of what
+    // reads as depth underwater. Air scatters roughly uniformly, so the sky world gets the single-
+    // coefficient aerial haze instead. The fish branch uses exactly the same model as the raymarched
+    // medium in `render/ocean.wgsl`, so a fish and the water around it can never disagree.
+    if (scene.mesh.variant < 0.5) {
+        color = water_medium(color, distance);
+    } else {
+        color = mix(color, scene.fog_color, medium_blend(distance));
+    }
 
     return vec4<f32>(color, 1.0);
 }

@@ -332,8 +332,10 @@ impl GpuProfiler {
         // guaranteed to be 8-byte aligned, and the timestamps are native-endian, which is what the
         // GPU wrote.
         let ticks: Vec<u64> = view
-            .chunks_exact(8)
-            .map(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap_or([0; 8])))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_ne_bytes(*chunk))
             .collect();
         drop(view);
         self.readback.unmap();

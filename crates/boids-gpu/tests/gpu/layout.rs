@@ -11,14 +11,17 @@
 //! ramp value at that field's offset. Any disagreement shows up as a specific wrong number at a
 //! specific index, reported with both byte offsets so the fix is mechanical.
 
-use boids_core::layout::{Boid, CameraUniform, InteractionUniforms, MeshParams, SceneUniform, SimParams};
+use boids_core::layout::{
+    Boid, CameraUniform, InteractionUniforms, MeshParams, PostParams, SceneUniform, SimParams,
+    WaterParams,
+};
 use boids_gpu::context::GpuContext;
 use boids_gpu::transfer::read_buffer;
 
 use crate::common::Check;
 
 /// Number of scalar slots the probe writes. Must match `PROBE_SLOTS` in the probe shader.
-const PROBE_SLOTS: usize = 64;
+const PROBE_SLOTS: usize = 88;
 
 /// Bytes of ramp written into each input buffer. Comfortably larger than every struct, and a multiple
 /// of 16 so the storage binding alignment rules are trivially satisfied.
@@ -105,6 +108,36 @@ fn expected_offsets() -> Vec<(usize, u32, Kind)> {
     scalar!(out, 58, InteractionUniforms, tangent, Kind::F32);
     scalar!(out, 59, InteractionUniforms, _pad, Kind::F32);
 
+    // WaterParams, slots 60..72. The Rust side stores the extinction as one `[f32; 3]` member, so it
+    // is expanded here into the three WGSL scalars it mirrors.
+    scalar!(out, 60, WaterParams, surface_y, Kind::F32);
+    scalar!(out, 61, WaterParams, floor_y, Kind::F32);
+    scalar!(out, 62, WaterParams, reef_period, Kind::F32);
+    scalar!(out, 63, WaterParams, caustic_strength, Kind::F32);
+    let extinction = core::mem::offset_of!(WaterParams, extinction) as u32;
+    out.push((64, extinction, Kind::F32));
+    out.push((65, extinction + 4, Kind::F32));
+    out.push((66, extinction + 8, Kind::F32));
+    scalar!(out, 67, WaterParams, scatter, Kind::F32);
+    scalar!(out, 68, WaterParams, godray_strength, Kind::F32);
+    scalar!(out, 69, WaterParams, surface_glow, Kind::F32);
+    scalar!(out, 70, WaterParams, caustic_scale, Kind::F32);
+    scalar!(out, 71, WaterParams, caustic_drift, Kind::F32);
+
+    // PostParams, slots 72..84.
+    scalar!(out, 72, PostParams, exposure, Kind::F32);
+    scalar!(out, 73, PostParams, bloom_threshold, Kind::F32);
+    scalar!(out, 74, PostParams, bloom_knee, Kind::F32);
+    scalar!(out, 75, PostParams, bloom_strength, Kind::F32);
+    scalar!(out, 76, PostParams, vignette, Kind::F32);
+    scalar!(out, 77, PostParams, grain, Kind::F32);
+    scalar!(out, 78, PostParams, aberration, Kind::F32);
+    scalar!(out, 79, PostParams, tonemap_white, Kind::F32);
+    scalar!(out, 80, PostParams, time, Kind::F32);
+    scalar!(out, 81, PostParams, saturation, Kind::F32);
+    scalar!(out, 82, PostParams, contrast, Kind::F32);
+    scalar!(out, 83, PostParams, lift, Kind::F32);
+
     out
 }
 
@@ -126,6 +159,8 @@ fn run_probe(ctx: &GpuContext) -> Vec<f32> {
     let boid_in = make_input("probe boid input");
     let params_in = make_input("probe params input");
     let interaction_in = make_input("probe interaction input");
+    let water_in = make_input("probe water input");
+    let post_in = make_input("probe post input");
     let values_out = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("probe output"),
         size: (PROBE_SLOTS * 4) as u64,
@@ -133,7 +168,9 @@ fn run_probe(ctx: &GpuContext) -> Vec<f32> {
         mapped_at_creation: false,
     });
 
-    let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..4)
+    // Bindings 0..=5, with binding 3 the only read-write one: the inputs are read, the probe output
+    // is written. `binding != 3` encodes exactly that.
+    let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..6)
         .map(|binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -167,6 +204,8 @@ fn run_probe(ctx: &GpuContext) -> Vec<f32> {
             bind(1, &params_in),
             bind(2, &interaction_in),
             bind(3, &values_out),
+            bind(4, &water_in),
+            bind(5, &post_in),
         ],
     });
     let pipeline_layout = ctx
@@ -269,7 +308,7 @@ fn describe(v: f32) -> String {
 /// reported as a named check with the actual numbers, which is far more useful than a compile error
 /// pointing at a `const _` block.
 pub fn struct_sizes_are_exact(_ctx: &GpuContext) -> Check {
-    let table: [(&str, usize, usize, usize); 7] = [
+    let table: [(&str, usize, usize, usize); 9] = [
         ("Boid", core::mem::size_of::<Boid>(), core::mem::align_of::<Boid>(), 48),
         ("SimParams", core::mem::size_of::<SimParams>(), core::mem::align_of::<SimParams>(), 144),
         (
@@ -296,6 +335,18 @@ pub fn struct_sizes_are_exact(_ctx: &GpuContext) -> Check {
             core::mem::size_of::<boids_core::layout::KeyVal>(),
             core::mem::align_of::<boids_core::layout::KeyVal>(),
             8,
+        ),
+        (
+            "WaterParams",
+            core::mem::size_of::<WaterParams>(),
+            core::mem::align_of::<WaterParams>(),
+            48,
+        ),
+        (
+            "PostParams",
+            core::mem::size_of::<PostParams>(),
+            core::mem::align_of::<PostParams>(),
+            48,
         ),
     ];
 

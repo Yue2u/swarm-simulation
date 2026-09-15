@@ -166,6 +166,10 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
         FrameInput {
             binding: SceneBinding::new(sim.read_index()),
             num_agents,
+            world: config.mode,
+            water: boids_scene::water_params(&config),
+            interaction,
+            post: boids_scene::post_params(config.mode, 0.0),
         },
     );
 

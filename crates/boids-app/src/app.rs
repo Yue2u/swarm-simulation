@@ -413,6 +413,16 @@ impl BoidsApp {
             .map_or(0, |(resources, _)| resources.read_index());
         #[allow(clippy::cast_possible_truncation)]
         let num_agents = self.sim_config.num_boids as u32;
+        // Built here, with the scene uniform, rather than inside the `render` call below: `renderer`
+        // is borrowed mutably for that call, and every one of these is derived from `self`.
+        let input = FrameInput {
+            binding: SceneBinding::new(parity),
+            num_agents,
+            world: self.sim_config.mode,
+            water: boids_scene::water_params(&self.sim_config),
+            interaction: self.interaction(viewport),
+            post: boids_scene::post_params(self.sim_config.mode, self.sim_time),
+        };
 
         let Some(surface) = &mut self.surface else {
             return;
@@ -430,15 +440,7 @@ impl BoidsApp {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let stats = renderer.render(
-            gpu,
-            &view,
-            &scene,
-            FrameInput {
-                binding: SceneBinding::new(parity),
-                num_agents,
-            },
-        );
+        let stats = renderer.render(gpu, &view, &scene, input);
 
         gpu.queue.present(frame);
         self.frames += 1;

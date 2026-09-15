@@ -356,6 +356,89 @@ pub struct SceneUniform {
     pub fog_density: f32,
 }
 
+/// Underwater medium and reef geometry for the ocean raymarch pass.
+///
+/// Mirrored in WGSL as `WaterParams`. 48 bytes, twelve scalars, no vector members, so there is no
+/// padding to reason about beyond the 16-byte total.
+///
+/// # Why the extinction is per channel
+///
+/// Beer-Lambert extinction in water is strongly wavelength-dependent: red is gone within a few metres
+/// and blue survives tens of them, which is the entire reason a reef at depth reads as teal and a
+/// distant one as deep blue. A single `fog_density` (as in `SceneUniform`) can darken a scene but
+/// cannot produce that shift, and the shift is most of what "underwater" looks like. The three
+/// coefficients are metres^-1 and already absolute, so `exp(-sigma * d)` is the transmittance for
+/// each channel.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct WaterParams {
+    /// Height of the water surface, metres. Rays above it see the surface from below.
+    pub surface_y: f32,
+    /// Seafloor height, metres. Matches `env_floor_y` in the simulation's reef field.
+    pub floor_y: f32,
+    /// Reef column repetition period, metres. Matches `env_scale` in the reef field.
+    pub reef_period: f32,
+    /// Caustic intensity on surfaces, in linear HDR units.
+    pub caustic_strength: f32,
+
+    /// Per-channel extinction coefficient, metres^-1: `(red, green, blue)`.
+    pub extinction: [f32; 3],
+    /// Scale on the in-scattered light that fills the medium, so the water is not black between
+    /// surfaces.
+    pub scatter: f32,
+
+    /// Intensity of the god-ray (shaft) term.
+    pub godray_strength: f32,
+    /// Brightness of the water surface seen from below, which is where most of the light comes from.
+    pub surface_glow: f32,
+    /// Spatial frequency of the caustic cell pattern, in metres^-1.
+    pub caustic_scale: f32,
+    /// Caustic animation rate, in hertz of pattern drift.
+    pub caustic_drift: f32,
+}
+
+/// HDR post-processing parameters: exposure, bloom, the lens terms and the final grade.
+///
+/// Mirrored in WGSL as `PostParams`. 48 bytes, twelve scalars.
+///
+/// These are separate from [`SceneUniform`] because they are read by the post passes, which run on
+/// full-screen targets with their own bind group, and because the render scene uniform is already at
+/// the size where adding two more `vec3`-sized concerns would make it a struct nobody can hold in
+/// their head at once.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct PostParams {
+    /// Exposure applied before the tone curve. The one knob that has to differ per world: sunlight
+    /// through 30 metres of water arrives about two stops dimmer than open sky.
+    pub exposure: f32,
+    /// Luminance above which a pixel contributes to bloom.
+    pub bloom_threshold: f32,
+    /// Width of the soft knee around the threshold, as a fraction of it.
+    pub bloom_knee: f32,
+    /// How much of the bloom pyramid is added back into the frame.
+    pub bloom_strength: f32,
+
+    /// Corner darkening. 0 disables it.
+    pub vignette: f32,
+    /// Film grain amplitude, in output units before the tone curve.
+    pub grain: f32,
+    /// Chromatic aberration at the frame edge, in UV units.
+    pub aberration: f32,
+    /// Luminance mapped to white by the tone curve; the ACES fit saturates rather than clipping.
+    pub tonemap_white: f32,
+
+    /// Simulation time, seconds. Animated grain and the dither offset live here so that the post
+    /// passes need no uniform of their own beyond this struct.
+    pub time: f32,
+    /// Saturation applied after the tone curve. 1 is neutral.
+    pub saturation: f32,
+    /// Contrast around mid grey, applied after the tone curve. 1 is neutral.
+    pub contrast: f32,
+    /// Black level added after the tone curve; the negative direction crushes the deepest shadows,
+    /// which is what keeps the underwater frame from looking flat after the exposure lift.
+    pub lift: f32,
+}
+
 /// Which environment field the simulation avoids. Mirrors the `ENV_*` constants in WGSL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
@@ -408,6 +491,12 @@ const _: () = {
 
     assert!(core::mem::size_of::<SceneUniform>() == 304);
     assert!(core::mem::align_of::<SceneUniform>() == 16);
+
+    assert!(core::mem::size_of::<WaterParams>() == 48);
+    assert!(core::mem::align_of::<WaterParams>() == 16);
+
+    assert!(core::mem::size_of::<PostParams>() == 48);
+    assert!(core::mem::align_of::<PostParams>() == 16);
 };
 
 /// Field offsets of every GPU struct, as the host sees them.
@@ -422,8 +511,12 @@ pub struct OffsetTable {
     pub sim_params: [u32; 16],
     /// `InteractionUniforms` field offsets in declaration order.
     pub interaction: [u32; 7],
-    /// Sizes of the structs, in the same order.
-    pub sizes: [u32; 3],
+    /// `WaterParams` field offsets in declaration order.
+    pub water: [u32; 12],
+    /// `PostParams` field offsets in declaration order.
+    pub post: [u32; 12],
+    /// Sizes of the structs, in the same order as the fields above.
+    pub sizes: [u32; 5],
 }
 
 /// Builds the host-side [`OffsetTable`] with `offset_of!`.
@@ -465,10 +558,42 @@ pub const fn offset_table() -> OffsetTable {
             core::mem::offset_of!(InteractionUniforms, falloff) as u32,
             core::mem::offset_of!(InteractionUniforms, tangent) as u32,
         ],
+        water: [
+            core::mem::offset_of!(WaterParams, surface_y) as u32,
+            core::mem::offset_of!(WaterParams, floor_y) as u32,
+            core::mem::offset_of!(WaterParams, reef_period) as u32,
+            core::mem::offset_of!(WaterParams, caustic_strength) as u32,
+            core::mem::offset_of!(WaterParams, extinction) as u32,
+            core::mem::offset_of!(WaterParams, scatter) as u32,
+            core::mem::offset_of!(WaterParams, godray_strength) as u32,
+            core::mem::offset_of!(WaterParams, surface_glow) as u32,
+            core::mem::offset_of!(WaterParams, caustic_scale) as u32,
+            core::mem::offset_of!(WaterParams, caustic_drift) as u32,
+            // The three extinction channels are one `[f32; 3]` member on the Rust side and three
+            // scalars in WGSL, so the table has to expand them to stay comparable slot for slot.
+            core::mem::offset_of!(WaterParams, extinction) as u32 + 4,
+            core::mem::offset_of!(WaterParams, extinction) as u32 + 8,
+        ],
+        post: [
+            core::mem::offset_of!(PostParams, exposure) as u32,
+            core::mem::offset_of!(PostParams, bloom_threshold) as u32,
+            core::mem::offset_of!(PostParams, bloom_knee) as u32,
+            core::mem::offset_of!(PostParams, bloom_strength) as u32,
+            core::mem::offset_of!(PostParams, vignette) as u32,
+            core::mem::offset_of!(PostParams, grain) as u32,
+            core::mem::offset_of!(PostParams, aberration) as u32,
+            core::mem::offset_of!(PostParams, tonemap_white) as u32,
+            core::mem::offset_of!(PostParams, time) as u32,
+            core::mem::offset_of!(PostParams, saturation) as u32,
+            core::mem::offset_of!(PostParams, contrast) as u32,
+            core::mem::offset_of!(PostParams, lift) as u32,
+        ],
         sizes: [
             core::mem::size_of::<Boid>() as u32,
             core::mem::size_of::<SimParams>() as u32,
             core::mem::size_of::<InteractionUniforms>() as u32,
+            core::mem::size_of::<WaterParams>() as u32,
+            core::mem::size_of::<PostParams>() as u32,
         ],
     }
 }
@@ -497,6 +622,10 @@ mod tests {
         assert_eq!(bytemuck::bytes_of(&mesh).len(), 80);
         let scene = SceneUniform::zeroed();
         assert_eq!(bytemuck::bytes_of(&scene).len(), 304);
+        let water = WaterParams::zeroed();
+        assert_eq!(bytemuck::bytes_of(&water).len(), 48);
+        let post = PostParams::zeroed();
+        assert_eq!(bytemuck::bytes_of(&post).len(), 48);
     }
 
     #[test]
@@ -506,6 +635,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<Boid>(), 48);
         assert_eq!(core::mem::size_of::<SimParams>(), 144);
         assert_eq!(core::mem::size_of::<InteractionUniforms>(), 48);
+        assert_eq!(core::mem::size_of::<WaterParams>(), 48);
+        assert_eq!(core::mem::size_of::<PostParams>(), 48);
     }
 
     #[test]

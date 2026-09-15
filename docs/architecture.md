@@ -21,8 +21,8 @@ nothing but `glam` and `bytemuck`.
 |---|---|---|
 | `boids-core` | every `#[repr(C)]` struct that WGSL also declares, the CPU reference implementation of a step, camera and cursor-ray math, the SDF and terrain fields with their CPU twins, the deterministic RNG and swarm spawn, the `//#include` WGSL preprocessor | any `wgpu` type at all. It builds and tests without a GPU, which is why the force model can be developed and refuted in seconds |
 | `boids-gpu` | adapter/device/surface acquisition, the ping-pong agent buffers, the spatial grid buffers, the parameter uniforms, the compute pipelines and their bind groups | rendering, biomes, input |
-| `boids-scene` | procedural environments and art content: SDF fields, heightfields, biomes, palettes, mesh prototypes | computation or presentation |
-| `boids-render` | the frame graph: depth target, scene uniform and its parity bind groups, the background and agent passes, texture readback, PNG output | simulation state or input |
+| `boids-scene` | the per-world numbers behind the look: water medium and reef geometry, post-processing parameters, and (day 4) heightfields, biomes, palettes and mesh prototypes | computation or presentation |
+| `boids-render` | the frame graph: HDR and depth targets, scene uniform and its parity bind groups, the sky backdrop, the underwater raymarch, the agent pass, the bloom pyramid and the composite, texture readback, PNG output | simulation state or input |
 | `boids-app` | the window, input accumulation, the camera, the frame loop, the mode switch, the CLI, headless screenshots | anything that knows how a pass works |
 
 The split exists so that a change to the force model cannot require a GPU, and a change to a shader
@@ -30,14 +30,17 @@ cannot require a window. Both of those paid off within the first day.
 
 ## Frame data flow
 
-A frame moves data in one direction. The CPU writes three small uniform structs and nothing else.
+A frame moves data in one direction. The CPU writes four small uniform structs and nothing else.
 
 ```
                      +------------------------------- CPU (once per frame) ---
   input events  -->  | OrbitCamera                   |
                      |  -> CameraUniform             |
                      |  -> SimParams        (144 B)  |
+                     |  -> SceneUniform     (304 B)  |
+                     |  -> WaterParams       (48 B)  |
                      |  -> InteractionUniforms (48 B)|  <- cursor ray vs plane
+                     |  -> PostParams        (48 B)  |
                      +-------------------------------+
                                      |
   ------------------- GPU ------------------------------------------------
@@ -49,11 +52,21 @@ A frame moves data in one direction. The CPU writes three small uniform structs 
                                       |
                      swap ping-pong parity
                                       |
-  6. background pass    one full-screen triangle, no depth write
-  7. agent pass         one instanced draw, depth test + write
+  6. environment        sky: full-screen gradient, no depth write
+                        sea: full-screen SDF raymarch, writes depth
+  7. agent pass         one instanced draw, depth test LessEqual, depth write
                                       |
-  8. present
+  8. bloom              bright, two downsamples, two additive upsamples
+  9. composite          aberration, exposure, ACES, grade -> swapchain
+                                      |
+ 10. present
 ```
+
+Passes 6 and 7 share one render pass and one depth attachment, which is what puts a fish behind a
+column: the raymarch writes the real hit distance and the agent pass tests against it. Passes 8 and 9
+run on the `Rgba16Float` intermediate and a three-level bloom pyramid, with no depth; the composite
+owns the transfer function. The render graph and why the intermediate is HDR rather than 8-bit are
+`ADR-0004`; why the underwater environment is a depth-writing raymarch is `ADR-0005`.
 
 Passes 1-4 build the spatial grid and are what `Strategy::Grid` records; `Strategy::Naive` skips them
 and runs an all-pairs search in pass 5 instead, which is exact and faster below the crossover in
@@ -138,13 +151,15 @@ never see each other and every assertion about flocking would pass or fail for t
 
 **Device checks** (`boids-gpu/tests/gpu`). One device, main thread, sequential. Shader compilation,
 struct layout validated against `offset_of!`, GPU-versus-CPU equality after one step and after 600
-steps, and the grid: the sorted keys against a CPU bitonic sort, the range invariants, an unprepared
-grid finding no neighbours, and the grid search agreeing with all-pairs after one step and over a long
-run.
+steps, the SDF and terrain fields against their Rust twins on a 32^3 grid, and the grid: the sorted
+keys against a CPU bitonic sort, the range invariants, an unprepared grid finding no neighbours, and the
+grid search agreeing with all-pairs after one step and over a long run.
 
 **Render checks** (`boids-render/tests/render_suite`). Renders real frames off screen and asserts
-properties of the pixels and the depth buffer. This is the only automated way to know a picture was
-produced at all.
+properties of the pixels and the depth buffer: structure in the backdrop, agents contributing pixels,
+depth written and plausible, the two worlds differing, the ocean raymarch writing real distances, the
+water being blue-dominant, bloom adding light, and the cursor marker being visible. This is the only
+automated way to know a picture was produced at all.
 
 Capability gaps are reported as *skipped*, with the reason, rather than failed: a suite that is red
 because a backend cannot copy depth to a buffer is a suite people stop reading.

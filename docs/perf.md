@@ -112,8 +112,17 @@ for scale only:
 | bitonic sort of 131,072 keys | ~2-4 ms | 5.7 ms |
 | hash + build_ranges + clear | ~1 ms | 0.36 ms |
 | agent rendering | ~2-3 ms | not measured (no present path) |
-| background | <0.5 ms | not measured |
-| post-processing | ~2-3 ms | not built yet |
+| sky backdrop | <0.5 ms | not measured |
+| underwater raymarch | ? | not measured; heaviest render pass (up to 80 SDF steps/pixel) |
+| bloom + composite | ~1-2 ms | not measured |
+
+The last two rows are built as of day 3. The post chain is fixed-cost and independent of the agent
+count: six full-screen passes at half, quarter and eighth resolution (a bright pass, two downsamples,
+two additive upsamples, and the composite), plus one `Rgba16Float` scene target. The underwater
+raymarch is the one render pass whose cost scales with the *world*, not the swarm, because every pixel
+marches the reef field; `render/ocean.wgsl` is written so that the sample count and the step cap are
+the two levers, and half-resolution rendering of that pass alone is the documented fallback
+(`ADR-0005`). Both are waiting on the target machine, for the reason in the next section.
 
 ## Things that were measurably worth doing
 
@@ -149,7 +158,9 @@ for scale only:
 * Anything on the target GPU (Vulkan, RTX 4060 Ti over its own Vulkan driver). This is the single most
   important number in the project and it needs the target machine.
 * Rendering and presentation cost at 100k, which cannot be measured where the GL adapter cannot present
-  a swapchain.
+  a swapchain. That includes the underwater raymarch and the whole post chain: both are built and
+  covered by the render suite (which checks their output, not their cost), and neither has a measured
+  millisecond figure yet.
 * Memory bandwidth and occupancy per pass. Neither is a limit at the tested counts, and the profiling
   tools that would report them (`nvidia-smi`, Nsight) target the 4060 Ti, which the GL path here does
   not use.

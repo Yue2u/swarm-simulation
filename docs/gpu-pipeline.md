@@ -82,6 +82,8 @@ of the space it can see.
 | `params` | 144 | UNIFORM, COPY_DST |
 | `interaction` | 48 | UNIFORM, COPY_DST |
 | `scene` | 304 | UNIFORM, COPY_DST |
+| `water` | 48 | UNIFORM, COPY_DST |
+| `post` | 48 | UNIFORM, COPY_DST |
 
 `padded_n` is `num_boids` rounded up to a power of two, because the bitonic sort can only sort a
 power-of-two count. `cell_start` is filled with `EMPTY_CELL` (`u32::MAX`) at allocation, and
@@ -98,6 +100,25 @@ the invariants `integrate_grid` searches under. Nothing in a frame copies either
 fish world is 91 x 40 x 91 = 331,240 cells, 1.3 MB per range array. The grid is a *direct* index
 rather than a hash, so there are no collisions and no hash table, which `ADR-0003` records as a
 deliberate trade.
+
+## Render targets
+
+The scene is drawn into attachments the renderer owns, not into the swapchain; only the composite
+writes the swapchain (`ADR-0004`).
+
+| target | format | size @1440p | usage |
+|---|---|---|---|
+| HDR scene | `Rgba16Float` | 12.6 MB | RENDER_ATTACHMENT, TEXTURE_BINDING |
+| depth | `Depth32Float` | 7.9 MB | RENDER_ATTACHMENT (writable depth for the ocean's `frag_depth`) |
+| bloom level 0..2 | `Rgba16Float` | 720p / 360p / 180p | RENDER_ATTACHMENT, TEXTURE_BINDING |
+
+`Rgba16Float` rather than `Rgba32Float`: the scene contains values far above 1.0 (caustics, the surface,
+bioluminescence) and half-float keeps both the range and the *exponent*, at half the bandwidth. The
+format is chosen once, in `targets.rs`, and every geometry pipeline is built against it. `Depth32Float`
+rather than `Depth24PlusStencil8`: nothing uses stencil, and the ocean raymarch writes real distances
+in the hundreds of metres into this buffer, so the extra precision matters. The bloom pyramid is
+recreated whenever the target size changes, with every bind group that references a level, so a resize
+cannot leave half the chain pointing at a previous size.
 
 ## Bind groups
 
@@ -137,9 +158,35 @@ stages, so a read-only key array there would make the sort impossible. Pinning t
 `keys[0]` (see `KeyPlan` below) means every consumer binds the same key buffer, and the sort's
 ping-pong stays entirely inside group 1.
 
-**Group 0, rendering.** A separate layout for the render passes: `SceneUniform` plus the agent array,
-with the agent buffer bound as a storage buffer rather than a vertex buffer. Both parities are bound up
-front for the same reason as above.
+**Group 0, rendering.** A separate layout for the scene passes:
+
+| binding | resource | visible to |
+|---|---|---|
+| 0 | `scene` uniform (`SceneUniform`) | vertex + fragment |
+| 1 | `boids` storage array, read | vertex + fragment |
+| 2 | `water` uniform (`WaterParams`) | fragment |
+| 3 | `interaction` uniform (`InteractionUniforms`) | fragment |
+| 4 | `post` uniform (`PostParams`) | fragment |
+
+The agent buffer is bound as a storage buffer rather than a vertex buffer. Both parities are bound up
+front for the same reason as the simulation pair. `water`, `interaction` and `post` live here because
+every pass that shades the medium needs some of them, and one group means one `set_bind_group` per pass;
+`post` is the *same buffer* the post chain binds in its own group, so there is one upload per frame and
+one struct that can be stale (`boids-render/src/scene.rs`).
+
+**Group 0, post.** The bloom and composite passes use their own group, since they sample textures and
+read only `PostParams`:
+
+| binding | resource |
+|---|---|
+| 0 | `post` uniform (`PostParams`) |
+| 1 | linear, clamp-to-edge sampler |
+| 2 | `post_src` texture (`texture_2d<f32>`) |
+| 3 | `post_bloom` texture (the composite's bloom level 0; the bloom passes repeat `post_src`) |
+
+One layout covers all four post pipelines (`fs_bright`, `fs_down`, `fs_up`, `fs_composite`). The second
+texture slot is inert for the bloom passes, which bind their source to both slots rather than introduce
+a second three-binding layout for one unused field.
 
 ## The bitonic sort and `KeyPlan`
 
@@ -217,12 +264,28 @@ it is genuinely faster than a grid plus its sort, and as the reference the grid 
 
 ### Render passes
 
+One frame is one scene render pass plus the post chain. The environment and the agents share one pass
+and one depth attachment, which is what lets a fish sit behind a column:
+
 ```
-1. background   draw(0..3, 0..1)          no vertex buffer, no depth write, compare Always
-2. agents       draw(0..66, 0..num_boids) mesh from vertex_index, transform from the agent buffer
+scene pass (HDR target + depth, depth cleared to 1.0)
+  1. environment   Fish:  ocean.wgsl       draw(0..3, 0..1)   compare Always, frag_depth written
+                   Birds: background.wgsl  draw(0..3, 0..1)   compare Always, no depth write
+  2. agents        boid.wgsl               draw(0..66, 0..num_boids)  compare LessEqual, depth write
+post chain (no depth)
+  3. bloom bright  draw(0..3, 0..1)   hdr -> bloom[0]
+  4. bloom down    draw(0..3, 0..1)   bloom[i-1] -> bloom[i]
+  5. bloom up      draw(0..3, 0..1)   bloom[i] -> bloom[i-1], additive
+  6. composite     draw(0..3, 0..1)   hdr + bloom[0] -> swapchain
 ```
 
-Neither pass has a vertex buffer. The agent mesh is a pure function of `vertex_index` (22 triangles: a
+The underwater environment writes `frag_depth` from the raymarched hit (`ADR-0005`), so the agent
+pipeline's `LessEqual` test against the 1.0 clear rejects a fish behind rock and keeps one in front of
+the seafloor. The ocean pass runs first and with `CompareFunction::Always`, so it overwrites the clear
+rather than testing against it. The sky backdrop writes no depth, so birds depth-test only against each
+other.
+
+No pass has a vertex buffer. The agent mesh is a pure function of `vertex_index` (22 triangles: a
 body, a tail fin, and two wing triangles that are degenerate for fish), and the per-agent transform
 comes from the storage buffer indexed by `instance_index`.
 
@@ -248,5 +311,5 @@ degenerate triangle because such a triangle has no pixels.
 | world | right-handed, Y up, metres |
 | camera | orbit around a target; `u32` viewport in physical pixels |
 | the screen-space Y flip | applied exactly once, in `ray_from_ndc` on the CPU and in the backdrop's deprojection on the GPU |
-| blend | none. The backdrop and the agents both write opaque |
+| blend | none in the scene pass; the bloom upsample adds (`One`/`One`), the composite replaces |
 | winding | no culling; the fins and wings are single-sided by construction |

@@ -44,7 +44,11 @@ pub fn mesh_profile(mode: SimMode, speed_ref: f32, perception_radius: f32) -> Me
             // Fish have no wings; the wing triangles are degenerate.
             wing_span: 0.0,
             wing_sweep: 0.0,
-            emissive: 0.35,
+            // Strong enough that a fish is a light source in the HDR frame and the bloom pass picks
+            // it out of the water. The underwater world is dim and hazy by construction, and a fish
+            // that only reflected light with its flanks would be a teal silhouette against teal; the
+            // emission is what keeps the swarm the subject of its own frame.
+            emissive: 1.2,
             variant: 0.0,
             // Cyan through violet: the bioluminescent band, which is where the bloom pass will
             // later pick the strongest highlights.
@@ -103,9 +107,12 @@ pub fn scene_uniform(
     let (light_dir, ambient, fog_color, fog_density) = match mode {
         SimMode::Fish => (
             // Sunlight from above and slightly to one side, so the reef casts readable columns of
-            // light and the fish are lit from above the way they would be underwater.
+            // light and the fish are lit from above the way they would be underwater. The ambient
+            // term is higher than the sky world's because water scatters light in from every
+            // direction: a fish whose flanks face away from the sun is still lit, which is not true
+            // in air.
             [0.25, -1.0, 0.15],
-            0.18,
+            0.26,
             [0.015, 0.115, 0.16],
             0.022,
         ),
