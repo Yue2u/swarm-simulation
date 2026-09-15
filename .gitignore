@@ -1,1 +1,5 @@
+# Rust build output
 /target
+
+# CodeGraph derived index: rebuilt with `codegraph init -i`, not a source artifact.
+.codegraph/
