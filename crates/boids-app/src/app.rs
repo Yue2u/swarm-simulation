@@ -51,6 +51,12 @@ pub struct StartupConfig {
     /// Off by default because reading the timings blocks the CPU until the GPU has finished the
     /// frame, which is a real cost in a loop that otherwise never waits. See `boids_gpu::profile`.
     pub profile: bool,
+    /// Neighbour search to force, or `None` to pick one from the agent count.
+    ///
+    /// The override exists so that the two strategies can be compared in the same window, on the same
+    /// swarm, without editing code: `Strategy::for_count` is only faster, never more correct, and a
+    /// measurement that cannot hold everything but the strategy constant is not a measurement.
+    pub strategy: Option<Strategy>,
 }
 
 impl Default for StartupConfig {
@@ -64,17 +70,10 @@ impl Default for StartupConfig {
             start_in_birds: false,
             deterministic: false,
             profile: false,
+            strategy: None,
         }
     }
 }
-
-/// Above this agent count the spatial grid is the faster strategy.
-///
-/// The crossover is not a clean analytic number: the all-pairs path does O(N) work per agent with a
-/// very low constant, while the grid does O(k) with a much higher constant plus the cost of the sort
-/// that feeds it. A few thousand agents is where they meet; `docs/perf.md` has the measured numbers
-/// on both sides of it.
-const NAIVE_AGENT_LIMIT: u32 = 4096;
 
 /// Frames between GPU profiling reports.
 ///
@@ -220,18 +219,17 @@ impl BoidsApp {
 
     /// The neighbour-search strategy for the current agent count.
     ///
-    /// All-pairs below [`NAIVE_AGENT_LIMIT`], the grid above it. The grid builds itself from scratch
-    /// every frame (see [`SimPipelines::record_grid_prep`]) and is the only strategy that scales to
-    /// the 100k target, but it pays for a 153-stage sort per frame that a few thousand agents do not
-    /// need.
+    /// The grid is the only strategy that scales to the 100k target, but it pays for a 153-stage sort
+    /// per frame (see [`SimPipelines::record_grid_prep`]) that a few thousand agents do not need, so
+    /// the crossover lives with the strategies themselves in `boids_gpu::sim`. `--strategy` overrides
+    /// the choice for an A/B measurement.
     fn strategy(&self) -> Strategy {
+        if let Some(forced) = self.startup.strategy {
+            return forced;
+        }
         #[allow(clippy::cast_possible_truncation)]
         let count = self.sim_config.num_boids as u32;
-        if count > NAIVE_AGENT_LIMIT {
-            Strategy::Grid
-        } else {
-            Strategy::Naive
-        }
+        Strategy::for_count(count)
     }
 
     /// Rebuilds the cursor interaction uniform for this frame.
@@ -253,7 +251,8 @@ impl BoidsApp {
         let camera = self.camera;
         let inv = camera.view_proj().inverse();
         let ray = boids_core::camera::ray_from_ndc(inv, cursor, viewport);
-        let plane_point = camera.eye() + camera.forward() * (camera.distance * INTERACTION_PLANE_FRACTION);
+        let plane_point =
+            camera.eye() + camera.forward() * (camera.distance * INTERACTION_PLANE_FRACTION);
         let plane_normal = -camera.forward();
 
         let Some(focus) = boids_core::camera::ray_plane_intersect(ray, plane_point, plane_normal)
@@ -347,7 +346,9 @@ impl BoidsApp {
         // Everything that needs an immutable view of `self` is computed first: `self.sim` has to be
         // borrowed mutably to ping-pong, and holding that borrow while calling back into `self` would
         // not compile. Ordering the work this way is clearer than threading the borrows through.
-        let Some(renderer) = &self.renderer else { return 0 };
+        let Some(renderer) = &self.renderer else {
+            return 0;
+        };
         let (width, height) = renderer.size();
         #[allow(clippy::cast_precision_loss)]
         let viewport = Vec2::new(width as f32, height as f32);
@@ -530,12 +531,7 @@ impl ApplicationHandler for BoidsApp {
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();

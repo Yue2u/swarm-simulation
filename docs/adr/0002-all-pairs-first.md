@@ -1,6 +1,6 @@
 # ADR 0002: all-pairs first, spatial grid second
 
-* Status: accepted, day 1; the grid lands on day 2
+* Status: accepted, day 1; the grid landed on day 2 (see ADR-0003)
 * Date: day 1 of the sprint
 
 ## Context
@@ -40,8 +40,9 @@ directly once the grid exists.
 
 **Negative.**
 
-* The 100k target is not reachable until day 2. The app's default agent count is 4096 with an explicit
-  warning above that, rather than a default that produces an unusable frame rate.
+* The 100k target was not reachable until day 2. At the time, the app's default agent count was 4096
+  with an explicit warning above that, rather than a default that produced an unusable frame rate; the
+  default is now 100,000 and `Strategy::for_count` picks the grid above it.
 * Two integration entry points must be kept in step. This is mitigated by having them share the force
   model: the only duplicated code is the neighbour loop, which is 20 lines each.
 * An unprepared grid is a live hazard: with `cell_start` uninitialised, the grid pass would read
@@ -62,4 +63,4 @@ that is not a price worth optimising away.
 **Sorting by Morton code instead of by cell index.** Rejected for now. It gives better memory locality
 for the neighbour scan at the cost of a more expensive key computation and a slightly harder argument
 that the 27 cells are the right set. Worth revisiting if the neighbour scan turns out to be
-memory-bound, which the day-2 profiler will show.
+memory-bound, which the profiler in `docs/perf.md` now shows.

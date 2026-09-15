@@ -3,7 +3,7 @@
 GPU flocking simulation in pure Rust + `wgpu`: 50k-100k agents, two procedural worlds, and a cursor
 that pushes the swarm around.
 
-Day 1 of a four-day sprint is done. See [Status](#status) for exactly what runs today and
+Days 1 and 2 of a four-day sprint are done. See [Status](#status) for exactly what runs today and
 [PLAN.md](PLAN.md) for the full plan.
 
 ![underwater](docs/screenshots/day1-fish.png)
@@ -21,9 +21,11 @@ Day 1 of a four-day sprint is done. See [Status](#status) for exactly what runs 
 
 ```bash
 cargo build --release
-./target/release/boids                    # 4096 agents, underwater
-./target/release/boids --birds            # sky world
-./target/release/boids --agents 200000    # more agents (see Status: needs the day-2 grid)
+./target/release/boids                       # 100000 agents, underwater
+./target/release/boids --birds               # sky world
+./target/release/boids --agents 200000       # more agents (keys pad to the next power of two)
+./target/release/boids --strategy naive      # force all-pairs, for an A/B comparison
+./target/release/boids --bench 120           # headless per-pass GPU timings, then exit
 ./target/release/boids --help
 ```
 
@@ -75,7 +77,12 @@ What the suites actually assert:
 | `reference/one_step_matches_cpu` | any drift in the force model, agent by agent, after one step |
 | `reference/many_steps_match_cpu_aggregates` | a systematic dynamic difference that per-agent comparison would miss |
 | `reference/swarm_polarises_on_gpu` | a swarm that moves but never forms flocks |
-| `grid/unprepared_finds_no_neighbours` | a grid pass reading uninitialised memory |
+| `sort/immediates_reach_the_shader` | sort stage parameters that do not reach the shader, so every stage replays the first |
+| `grid/sort_matches_cpu` | a bitonic network or padding rule that does not match a CPU sort |
+| `grid/unprepared_finds_no_neighbours` | a grid pass reading uninitialised or stale memory |
+| `grid/ranges_are_consistent` | a range array that does not partition the live agents, or a cell left stale |
+| `grid/matches_naive` | a grid search that finds a different neighbour set than all-pairs |
+| `grid/long_run_matches_naive` | a grid that is right at spawn but loses neighbours as the swarm moves |
 | `render/background_has_structure` | a missing backdrop pass, or a flipped Y in the ray reconstruction |
 | `render/agents_contribute_pixels` | a mesh function or instanced draw producing nothing |
 | `render/depth_is_written` | geometry rejected by the depth test (skipped where the backend cannot copy depth) |
@@ -87,24 +94,25 @@ simulation just behaves subtly wrong because `r_percept` on the host is `w_coh` 
 
 ## Status
 
-Day 1 complete:
+Days 1-2 complete:
 
-* fully GPU-resident simulation: ping-pong agent buffers, one compute pass per frame, no CPU loop over
-  agents,
+* fully GPU-resident simulation: ping-pong agent buffers, no CPU loop over agents,
 * the agent mesh and its orientation basis are generated in the vertex shader from `vertex_index` and
   the agent's velocity. There is no vertex buffer and no instance buffer,
 * both worlds render: a procedural sky/water backdrop, mode-specific mesh and medium parameters, and a
   `tab` switch that reallocates nothing,
 * cursor interaction: attract, repel with swirl, and a momentary override on the middle button,
-* headless screenshot mode.
+* headless screenshot mode,
+* **the spatial grid**: `clear_cells`, `hash`, a 153-stage bitonic sort and `build_ranges` rebuild the
+  grid every frame, and `integrate_grid` searches the 27 cells around each agent. 100,000 agents pad to
+  131,072 keys, and the grid search is checked against all-pairs agent by agent,
+* **strategy selection**: all-pairs below the measured crossover (1,024 agents), the grid above it, and
+  `--strategy naive|grid` to force either for an A/B comparison,
+* **`--bench`**: headless per-pass GPU timings via timestamp queries, which is where the numbers in
+  [docs/perf.md](docs/perf.md) come from.
 
 Not yet:
 
-* **the spatial grid**. Today the neighbour search is all-pairs, which is exact and O(N^2). 4096 agents
-  run at ~48 fps at 1440p on a *software* adapter; 16k agents is roughly sixteen times slower. The
-  grid, its bitonic sort and the range-building pass are day 2, and that is what unlocks the 50k-100k
-  target. The app warns loudly when the agent count crosses the point where all-pairs stops being the
-  right answer.
 * environment collision. The avoidance force and the reef and terrain fields exist and are unit
   tested, but `SimConfig::env` is not yet wired to a renderer that draws those surfaces.
 * volumetric underwater rendering, god rays, caustics, bloom, and the terrain mesh with its biomes:

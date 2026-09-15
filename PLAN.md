@@ -1,11 +1,26 @@
 # GPU Boids 3D (50k–100k агентов) на чистом Rust + wgpu
 
 Технический документ и план реализации. Спринт: 4 дня плотной разработки.
-Статус: **Day 1 — done**, Day 2 — next.
+Статус: **Day 1 — done**, **Day 2 — done**, Day 3 — next.
 
-## Статус на конец Дня 1
+## Статус на конец Дня 2
 
-Сделано (всё проверено тестами, `cargo test --workspace`):
+Сделано в День 2 (всё проверено тестами, `cargo test --workspace`):
+* spatial grid на direct-index: `clear_cells`, `hash`, `build_ranges`, инварианты диапазонов
+  проверены device-тестом на покрытие и пустые ячейки;
+* bitonic sort: 153 стадии для 131072 ключей, по одному compute-pass на стадию, параметры стадии
+  через `var<immediate>` + `set_immediates` (один pipeline и bind group на все стадии; отдельный
+  device-тест доказывает, что immediates доезжают до шейдера per-dispatch);
+* `KeyPlan` прибивает отсортированный массив к `keys[0]` независимо от чётности числа стадий;
+* GPU-sort сверяется с CPU-битоником на N, не кратных pow2, и на обеих чётностях стадий;
+* `integrate_grid` обходит 27 ячеек и сходится с all-pairs поштучно за 1 шаг и по агрегатам за 40;
+* unprepared grid находит ноль соседей (не читает мусор) — отдельный тест;
+* `Strategy::for_count` + `--strategy naive|grid`, порог `NAIVE_AGENT_LIMIT = 1024` замерен
+  `--bench` (кросовер чуть ниже 1536 агентов), дефолт приложения — 100000 агентов;
+* `--bench <N>`: headless-прогон с per-pass GPU-таймингами через timestamp queries, из него
+  пересобираются числа в `docs/perf.md`.
+
+Сделано в День 1:
 * workspace из 5 крейтов, `boids-core` без зависимости от `wgpu`;
 * контракт раскладки GPU-структур с `const`-assert'ами и **device-тестом**, который сверяет
   смещения полей в WGSL с Rust `offset_of!`;
@@ -18,15 +33,16 @@
 * headless-скриншоты в PNG (`--screenshot`), тесты на пиксели и глубину кадра;
 * документация: README, architecture, gpu-pipeline, math, perf, ADR-0001/0002.
 
-Не сделано (план на Дни 2-4 без изменений):
-* **spatial grid и bitonic sort** — сейчас поиск соседей all-pairs, O(N²). 4096 агентов дают ~48 fps
-  при 1440p даже на программном растеризаторе, 16k — в 16 раз медленнее. Это и есть День 2;
-* коллизии с окружением (силы и поля написаны и протестированы, но рендер поверхности ещё нет);
+Не сделано (план на Дни 3-4 без изменений):
+* рендер поверхности и коллизии с окружением (силы и поля написаны и протестированы, но
+  `SimConfig::env` ещё не связан с рендером этих поверхностей);
 * объёмный подводный рендер, god rays, каустика, bloom;
 * рельеф с биомами, атмосферное рассеяние, морфинг переключения миров.
 
-Замеры и их ограничения: `docs/perf.md`. Важное: локально доступен только `llvmpipe` (Vulkan) и
-GL-адаптер без презентации, поэтому 100k агентов и реальный FPS надо мерить на целевой машине.
+Замеры и их ограничения: `docs/perf.md`. Важное: локально доступны только `llvmpipe` (Vulkan) и
+GL-адаптер, который через Mesa `d3d12` попадает на встроенную Radeon и не презентит, поэтому 100k
+агентов и реальный FPS надо мерить на целевой машине. Числа `--bench` — это встроенная графика
+через D3D12→GL, не целевая 4060 Ti.
 
 ## 1. Цель
 
@@ -57,9 +73,9 @@ swarm_simulation/
 Ответственность: единственный источник правды о layout'ах и математике; эталон для валидации GPU.
 
 * `#[repr(C, align(16))] Boid` — 48 B: `pos: [f32;3]`, `species: f32`, `vel: [f32;3]`, `phase: f32`,
-  `color_seed: f32`, `energy: f32`, `prev_dir_x/z: [f32;2]` (для bank-угла в VS).
+  `prev_dir: [f32;3]`, `color_seed: f32` (prev_dir — для bank-угла в VS).
 * `KeyVal { key: u32, val: u32 }` — 8 B, ключ сортировки = linear cell index.
-* `SimParams` (128 B), `InteractionUniforms` (48 B), `CameraUniform`, `SortParams` — все align(16).
+* `SimParams` (144 B), `InteractionUniforms` (48 B), `CameraUniform`, `SortParams` — все align(16).
 * `const _: () = assert!(...)` на каждый размер/выравнивание. Ручной `unsafe impl Pod` запрещён.
 * `reference::step_cpu(&mut [Boid], &SimParams)` — наивный O(N²) эталон.
 * `sdf::{sphere, box, torus, column_field, plane, smin}` — те же формулы, что в WGSL.
@@ -78,15 +94,18 @@ pub struct SimResources {          // все буферы, создаются о
     pub cell_end: wgpu::Buffer,
     pub params: wgpu::Buffer,      // UNIFORM
     pub interaction: wgpu::Buffer, // UNIFORM
-    pub sort_params: wgpu::Buffer, // UNIFORM, dynamic offset per stage
-    pub read: usize,               // индекс актуального буфера
+    read: usize,                   // индекс актуального буфера
 }
-pub struct SimPipelines { hash, clear_cells, sort_local, sort_global, build_ranges,
-                          integrate_fish, integrate_bird }
-pub trait GpuStage { fn record(&self, enc: &mut CommandEncoder, res: &SimResources, ctx: &FrameCtx); }
-pub fn record_frame(...) -> usize;   // возвращает индекс буфера с готовыми позициями
+pub struct SimPipelines { clear_cells, hash, sort, build_ranges,
+                          integrate_naive, integrate_grid }
+pub struct KeyPlan { hash_dst: usize, stages: u32 }  // прибивает результат сортировки к keys[0]
+pub fn record_step(enc, res, strategy, profiler);    // grid prep + integrate, либо только integrate
 pub struct ShaderCache;              // include-препроцессор + опциональный hot-reload
 ```
+
+Параметры стадии сортировки идут не через uniform с dynamic offset, а через `var<immediate>` +
+`set_immediates`; `sort_local` (tile в shared memory) не понадобился и отложен вместе с radix
+(ADR-0003).
 
 deps: `wgpu`, `bytemuck`, `boids-core`, `log`.
 
@@ -137,7 +156,7 @@ deps: `wgpu`, `winit`, `glam`, `pollster`, `env_logger`, `log`, `boids-*`.
 |---|---|---|---|
 | `Boid` | 48 | `struct Boid` | array<Boid> stride 48, ок при 16-выравнивании полей |
 | `KeyVal` | 8 | `struct KeyVal` | только u32 |
-| `SimParams` | 128 | `struct SimParams` | каждый vec3 + f32/u32 |
+| `SimParams` | 144 | `struct SimParams` | каждый vec3 + f32/u32 |
 | `InteractionUniforms` | 48 | `struct Interaction` | ray_origin+f32, focus+f32, ... |
 | `SortParams` | 16 | `struct SortParams` | j, k, n, pad |
 
@@ -148,27 +167,30 @@ deps: `wgpu`, `winit`, `glam`, `pollster`, `env_logger`, `log`, `boids-*`.
 
 | Буфер | Размер @100k | usage |
 |---|---|---|
-| `boids[2]` | 2 x 4.8 MB (48 B x 100k) | STORAGE, COPY_SRC, COPY_DST |
-| `keys[2]` | 2 x 0.8 MB (padded до pow2) | STORAGE, COPY_SRC |
-| `cell_start`, `cell_end` | 2 x 4.2 MB (128x64x128 u32) | STORAGE |
-| `params`, `interaction`, `camera` | < 1 KB | UNIFORM, write_buffer раз в кадр |
-| `sort_params` | 16 B x num_stages | UNIFORM с dynamic offset |
+| `boids[2]` | 2 x 6.0 MB (48 B x 131072) | STORAGE, COPY_SRC, COPY_DST |
+| `keys[2]` | 2 x 1.0 MB (8 B x 131072) | STORAGE, COPY_SRC |
+| `cell_start`, `cell_end` | 2 x 1.3 MB (91x40x91 u32, дефолтный мир) | STORAGE, COPY_SRC |
+| `params`, `interaction` | < 1 KB | UNIFORM, write_buffer раз в кадр |
 
-Домен ограничен `bounds_half`, сетка фиксированная 128x64x128 -> прямая индексация без хеша
-(нет коллизий). Пустая ячейка = `U32_MAX` в `cell_start`.
+Домен ограничен `bounds_half`, сетка выводится из него и `r_percept` (`GridDims::for_domain`,
+не больше 256 ячеек на ось) -> прямая индексация без хеша (нет коллизий). Размер ячейки равен
+`r_percept` — это требование корректности 27-ячеечного поиска, а не тюнинг. Пустая ячейка = `U32_MAX`
+в `cell_start`.
 
 ### 3.3 Порядок compute-проходов кадра
 
 ```
-P0 clear_cells   dispatch ceil(num_cells/256)   cell_start[i] = U32_MAX
-P1 hash          dispatch ceil(n_padded/256)   keys[i] = KeyVal{cell_index(pos), i}; padding -> U32_MAX
-P2 bitonic       sort_local (1 dispatch, tile 512 в workgroup) + sort_global (по dispatch на (k,j))
-P3 build_ranges  if keys[i].key != keys[i-1].key { cell_start[k]=i; cell_end[prev]=i } + терминатор
+P0 clear_cells   dispatch ceil(num_cells/256)      cell_start[c] = U32_MAX
+P1 hash          dispatch ceil(n_padded/256)        keys[dst][i] = KeyVal{cell_index(pos), i}; padding -> U32_MAX
+P2 sort          по dispatch на стадию (k,j)        параметры через immediates, один pipeline
+P3 build_ranges  dispatch ceil((n_padded+1)/256)    диапазоны ячеек + терминатор последнего run
 P4 integrate     один поток на boid: 3x3x3 ячеек -> силы -> SDF -> курсор -> интеграция
 ```
 
-Sort: N padded до 131072 -> 17*18/2 = 153 стадии. `sort_local` съедает стадии с `k <= 512`
-внутри workgroup (shared memory tile), остальные идут глобальными dispatch'ами через dynamic offset.
+Sort: N padded до 131072 -> 17*18/2 = 153 стадии, каждая отдельным compute-pass (барьер между
+проходами и есть синхронизация). `KeyPlan` прибивает результат к `keys[0]` независимо от чётности
+числа стадий. `sort_local` (tile в shared memory) не понадобился; при упоре в 5.7 мс — radix
+(ADR-0003).
 
 ### 3.4 Рендер boids
 
@@ -330,9 +352,10 @@ DoD: TAB мгновенно переключает мир, 3 наземных б
 
 ## 9. Открытые вопросы
 
-1. Bitonic vs radix: выбран bitonic (проще, детерминирован). Radix 4-bit — оптимизация Day 5,
-   зафиксировано в ADR-0002 как отложенное.
-2. Прямая индексация сетки вместо хеша (ADR-0003): плата 8.4 МБ на таблицы диапазонов.
+1. Bitonic vs radix: выбран bitonic (проще, детерминирован; 153 стадии = 5.7 мс при 100k на
+   локальном адаптере). Radix — оптимизация Дня 5, зафиксировано в ADR-0003 как отложенное.
+2. Прямая индексация сетки вместо хеша (ADR-0003): плата 2.6 МБ на обе таблицы диапазонов при
+   дефолтном мире (91×40×91 ячейка), кросовер naive/grid — чуть ниже 1536 агентов.
 3. Окружение океана: raymarch SDF принят; при упоре в fps — half-res + upsample.
 4. egui-оверлей для тюнинга весов: включаем, если День 2 идёт по графику.
 5. Детерминированный режим `--deterministic` (фиксированный сид и dt) для скриншот-регрессий.

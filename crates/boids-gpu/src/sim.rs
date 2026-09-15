@@ -23,9 +23,9 @@
 //!
 //! Rather than carry that parity through the frame and pick a bind group for every consumer, the
 //! host removes it at startup: [`KeyPlan`] aims the hash pass at whichever buffer leaves the last
-//! stage writing `keys[0]`. Both consumers of the sorted order - `build_ranges` and `integrate_grid`
-//! - then read a fixed buffer through the fixed bind group 0, which is what keeps group 0 bound once
-//! for the lifetime of the simulation.
+//! stage writing `keys[0]`. Both consumers of the sorted order (`build_ranges` and `integrate_grid`)
+//! then read `keys[0]` through a fixed group-1 bind group, and group 0 is bound once for the lifetime
+//! of the simulation.
 //!
 //! # Buffer contract
 //!
@@ -52,9 +52,7 @@
 //! allocates, and at 60 fps that is a slow leak of driver objects.
 
 use boids_core::config::{GridDims, SimConfig};
-use boids_core::layout::{
-    Boid, InteractionUniforms, KeyVal, SimParams, SortParams, EMPTY_CELL,
-};
+use boids_core::layout::{Boid, InteractionUniforms, KeyVal, SimParams, SortParams, EMPTY_CELL};
 
 use crate::context::GpuContext;
 use crate::profile::GpuProfiler;
@@ -68,13 +66,71 @@ const KEYVAL_SIZE: u64 = core::mem::size_of::<KeyVal>() as u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strategy {
     /// All-pairs search on the GPU. Exact but O(N^2): intended for validation and for small swarms.
-    /// The app uses this below a few thousand agents, where it is faster than the grid because it
-    /// needs no sort.
+    /// `Strategy::for_count` selects it up to [`NAIVE_AGENT_LIMIT`], where it is faster than the grid
+    /// because it needs no sort.
     #[default]
     Naive,
     /// Spatial grid search over the 27 cells around each agent. Requires the hash, sort and range
     /// passes to have run for this frame; see [`SimPipelines::record_grid_prep`].
     Grid,
+}
+
+/// Agent count above which the grid is the faster strategy.
+///
+/// The crossover is not a clean analytic number: all-pairs does O(N) work per agent with a very low
+/// constant, while the grid does O(k) with a much higher constant plus the cost of the 153-stage sort
+/// that feeds it. Measured with `--bench` (per-pass GPU time, means over 30 frames):
+///
+/// | agents | all-pairs | grid |
+/// |---|---|---|
+/// | 512 | 0.23 ms | 0.44 ms |
+/// | 1,024 | 0.42 ms | 0.52 ms |
+/// | 1,536 | 0.61 ms | 0.62 ms |
+/// | 2,048 | 0.81 ms | 0.61 ms |
+/// | 4,096 | 1.80 ms | 0.78 ms |
+/// | 16,384 | 25.5 ms | 2.18 ms |
+///
+/// The two cross just under 1,536 agents, so the constant sits below that rather than on it. The
+/// asymmetry is what decides the rounding: below the crossover the grid wastes a roughly constant
+/// 0.2-0.3 ms of sort and dispatch work, while above it all-pairs loses ground quadratically - 1.8 ms
+/// at 4,096 and 25.5 ms at 16,384. Being one step early is cheap and bounded; being one step late is not.
+///
+/// The numbers come from WSL's D3D12-backed GL adapter, which is the integrated Radeon and not the
+/// target 4060 Ti (see `docs/perf.md`). A discrete GPU shifts the crossover up because the all-pairs
+/// kernel is the more parallel-friendly shape. That is a reason to re-measure on the target machine,
+/// not a reason to guess: the grid is correct at any agent count, so choosing wrong here costs frame
+/// time and never correctness.
+pub const NAIVE_AGENT_LIMIT: u32 = 1024;
+
+impl Strategy {
+    /// The faster strategy for an agent count.
+    #[must_use]
+    pub const fn for_count(num_boids: u32) -> Self {
+        if num_boids > NAIVE_AGENT_LIMIT {
+            Self::Grid
+        } else {
+            Self::Naive
+        }
+    }
+}
+
+/// The names the command line and the benchmark accept, so that a strategy can be forced on either
+/// side of [`NAIVE_AGENT_LIMIT`] instead of only being inferred from the agent count.
+///
+/// `auto` is deliberately not a variant: it is the *absence* of a choice, and the CLI represents it
+/// as not parsing a strategy at all.
+impl core::str::FromStr for Strategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "naive" | "all-pairs" => Ok(Self::Naive),
+            "grid" => Ok(Self::Grid),
+            other => Err(format!(
+                "unknown strategy {other:?}: expected `naive`, `grid` or `auto`"
+            )),
+        }
+    }
 }
 
 /// All GPU buffers that hold simulation state.
@@ -141,8 +197,16 @@ impl SimResources {
 
         let resources = Self {
             boids: [
-                make("boids[0]", boid_bytes, storage | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST),
-                make("boids[1]", boid_bytes, storage | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST),
+                make(
+                    "boids[0]",
+                    boid_bytes,
+                    storage | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                ),
+                make(
+                    "boids[1]",
+                    boid_bytes,
+                    storage | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                ),
             ],
             keys: [
                 make("keys[0]", key_bytes, storage | wgpu::BufferUsages::COPY_SRC),
@@ -180,8 +244,8 @@ impl SimResources {
             allocated_cells: num_cells,
         };
 
-        // Mark every cell empty up front. This is not just tidiness: until the range-building pass
-        // runs (day 2), a grid search must find no neighbours rather than read uninitialised memory.
+        // Mark every cell empty up front. This is not just tidiness: until the range-building pass has
+        // run, a grid search must find no neighbours rather than read uninitialised memory.
         // With `cell_start` at zero, `integrate_grid` would happily treat keys[0..cell_end] as a
         // cell's contents, which is garbage rather than a missing flock.
         resources.clear_cell_starts(&ctx.queue);
@@ -382,9 +446,10 @@ impl SimPipelines {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                core::mem::size_of::<InteractionUniforms>() as u64,
-                            ),
+                            min_binding_size: wgpu::BufferSize::new(core::mem::size_of::<
+                                InteractionUniforms,
+                            >()
+                                as u64),
                         },
                         count: None,
                     },
@@ -422,17 +487,18 @@ impl SimPipelines {
         let sort_module = ctx.shader_module("sim/sort", "sim/sort.wgsl");
         let ranges_module = ctx.shader_module("sim/ranges", "sim/ranges.wgsl");
 
-        let make = |label: &str, entry: &str, module: &wgpu::ShaderModule| -> wgpu::ComputePipeline {
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&pipeline_layout),
-                    module,
-                    entry_point: Some(entry),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    cache: None,
-                })
-        };
+        let make =
+            |label: &str, entry: &str, module: &wgpu::ShaderModule| -> wgpu::ComputePipeline {
+                ctx.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(&pipeline_layout),
+                        module,
+                        entry_point: Some(entry),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        cache: None,
+                    })
+            };
         let integrate_naive = make("integrate_naive", "integrate_naive", &integrate_module);
         let integrate_grid = make("integrate_grid", "integrate_grid", &integrate_module);
         let clear_cells = make("clear_cells", "clear_cells", &hash_module);
@@ -455,8 +521,20 @@ impl SimPipelines {
         // Group 1 always has the same three slots, and every bind group below fills the third with
         // the key array the sorted order lives in: `pair_bind_group` is the shape of all of them.
         let agent_bind_groups = [
-            pair_bind_group(ctx, &agent_layout, &res.boids[0], &res.boids[1], &res.keys[0]),
-            pair_bind_group(ctx, &agent_layout, &res.boids[1], &res.boids[0], &res.keys[0]),
+            pair_bind_group(
+                ctx,
+                &agent_layout,
+                &res.boids[0],
+                &res.boids[1],
+                &res.keys[0],
+            ),
+            pair_bind_group(
+                ctx,
+                &agent_layout,
+                &res.boids[1],
+                &res.boids[0],
+                &res.keys[0],
+            ),
         ];
         // The sort's pair, and the pair `build_ranges` reads the result through: a stage writes the
         // buffer it is not reading, and both slots follow `key_bind_groups[k] = keys[k] -> keys[1-k]`.
@@ -468,8 +546,20 @@ impl SimPipelines {
         // the one `key_plan` says leaves the sort's result in `keys[0]`. The third slot is inert and
         // has to be the agent array again, because the key buffer is already the read-write one.
         let hash_bind_groups = [
-            pair_bind_group(ctx, &agent_layout, &res.boids[0], &res.keys[key_plan.hash_dst], &res.boids[0]),
-            pair_bind_group(ctx, &agent_layout, &res.boids[1], &res.keys[key_plan.hash_dst], &res.boids[1]),
+            pair_bind_group(
+                ctx,
+                &agent_layout,
+                &res.boids[0],
+                &res.keys[key_plan.hash_dst],
+                &res.boids[0],
+            ),
+            pair_bind_group(
+                ctx,
+                &agent_layout,
+                &res.boids[1],
+                &res.keys[key_plan.hash_dst],
+                &res.boids[1],
+            ),
         ];
 
         log::debug!(
@@ -714,4 +804,78 @@ fn pair_bind_group(
         layout,
         entries: &[bind(0, src), bind(1, dst), bind(2, keys)],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every power of two the app can reach, from a demo swarm to the 2^21 ceiling of the profiler.
+    const PADDED_COUNTS: [u32; 6] = [1024, 4096, 32768, 131_072, 1 << 20, 1 << 21];
+
+    #[test]
+    fn key_plan_leaves_the_sorted_result_in_keys_zero() {
+        for padded_n in PADDED_COUNTS {
+            let plan = key_plan(padded_n);
+            let m = padded_n.trailing_zeros();
+            assert_eq!(plan.stages, m * (m + 1) / 2, "stage count for {padded_n}");
+
+            // Walk the ping-pong exactly as `record_grid_prep` records it: the hash fills
+            // `keys[hash_dst]`, stage `t` reads the pair whose source is that buffer and writes the
+            // other one.
+            let mut last_write = plan.hash_dst;
+            for (stage, _) in sort_stages(padded_n).enumerate() {
+                let read = (plan.hash_dst + stage) % 2;
+                last_write = 1 - read;
+            }
+            assert_eq!(
+                last_write, 0,
+                "{padded_n} keys pad to {m} bits, {} stages: the sorted array must land in keys[0]",
+                plan.stages
+            );
+        }
+    }
+
+    #[test]
+    fn sort_stages_walk_the_bitonic_network_in_order() {
+        let stages: Vec<(u32, u32)> = sort_stages(1024).collect();
+        // m = 10, so 1 + 2 + ... + 10 stages.
+        assert_eq!(stages.len(), 55);
+
+        // The sequence the shader documents: k ascending over the powers of two, and within each k
+        // the compare distance halving from k/2 down to 1.
+        let mut expected = Vec::new();
+        for exponent in 1..=10u32 {
+            let k: u32 = 1 << exponent;
+            for half in (0..exponent).rev() {
+                expected.push((k, 1u32 << half));
+            }
+        }
+        assert_eq!(stages, expected);
+    }
+
+    #[test]
+    fn strategy_threshold_splits_at_the_limit() {
+        assert_eq!(Strategy::for_count(1), Strategy::Naive);
+        assert_eq!(Strategy::for_count(NAIVE_AGENT_LIMIT), Strategy::Naive);
+        assert_eq!(Strategy::for_count(NAIVE_AGENT_LIMIT + 1), Strategy::Grid);
+        assert_eq!(Strategy::for_count(100_000), Strategy::Grid);
+    }
+
+    #[test]
+    fn strategy_names_round_trip() {
+        assert_eq!("naive".parse(), Ok(Strategy::Naive));
+        assert_eq!("grid".parse(), Ok(Strategy::Grid));
+        assert!("auto".parse::<Strategy>().is_err());
+        assert!("".parse::<Strategy>().is_err());
+    }
+
+    #[test]
+    fn dispatch_covers_the_tail_but_not_an_empty_range() {
+        assert_eq!(dispatch_size(0), 0);
+        assert_eq!(dispatch_size(1), 1);
+        assert_eq!(dispatch_size(256), 1);
+        assert_eq!(dispatch_size(257), 2);
+        assert_eq!(dispatch_size(131_072), 512);
+    }
 }

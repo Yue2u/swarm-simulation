@@ -42,5 +42,6 @@ pub use mesh_profile::{mesh_profile, scene_uniform};
 pub use profile::{FrameTimings, GpuProfiler, PassTotal, MAX_TIMED_PASSES};
 pub use sim::{
     dispatch_size, key_plan, sort_stages, KeyPlan, SimPipelines, SimResources, Strategy,
+    NAIVE_AGENT_LIMIT,
 };
 pub use transfer::{read_buffer, read_raw, upload_boids, upload_uniform};

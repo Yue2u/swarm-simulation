@@ -20,10 +20,10 @@
 //! compared element by element, and the agents inside one cell are compared as sets.
 
 use boids_core::config::SimConfig;
-use boids_core::layout::{InteractionUniforms, KeyVal, SimParams, EMPTY_CELL};
+use boids_core::layout::{Boid, InteractionUniforms, KeyVal, SimParams, EMPTY_CELL};
 use boids_core::math::{mean_speed, order_parameter};
 use boids_gpu::context::GpuContext;
-use boids_gpu::sim::Strategy;
+use boids_gpu::sim::{SimPipelines, SimResources, Strategy};
 use glam::Vec3;
 
 use crate::common::{run_gpu_steps, run_grid_prep, setup, Check};
@@ -44,16 +44,16 @@ fn roomy_config(n: usize, r_percept: f32, neighbours: f32) -> SimConfig {
     cfg.env = boids_core::layout::EnvironmentKind::None;
     let spawn_half = cfg.bounds_half * 0.6;
     cfg.bounds_half = spawn_half;
-    cfg.grid = boids_core::config::GridDims::for_domain(
-        spawn_half * 2.0,
-        cfg.grid.cell_size,
-        64,
-    );
+    cfg.grid = boids_core::config::GridDims::for_domain(spawn_half * 2.0, cfg.grid.cell_size, 64);
     cfg
 }
 
 /// The keys the CPU expects for a swarm, padded to `padded_n` exactly as the hash pass pads them.
-fn expected_keys(cfg: &SimConfig, swarm: &[boids_core::layout::Boid], padded_n: u32) -> Vec<KeyVal> {
+fn expected_keys(
+    cfg: &SimConfig,
+    swarm: &[boids_core::layout::Boid],
+    padded_n: u32,
+) -> Vec<KeyVal> {
     let mut keys: Vec<KeyVal> = (0..padded_n)
         .map(|i| KeyVal {
             // The padding entries carry `PAD_KEY`, which is `EMPTY_CELL`'s value: larger than any cell
@@ -81,7 +81,13 @@ fn expected_keys(cfg: &SimConfig, swarm: &[boids_core::layout::Boid], padded_n: 
 ///   a mistake there would write the sorted result into the buffer nothing reads.
 pub fn sort_matches_cpu(ctx: &GpuContext) -> Check {
     let mut problems = Vec::new();
-    for (n, seed) in [(1024usize, 1u64), (1000, 2), (4096, 3), (3000, 4), (5000, 5)] {
+    for (n, seed) in [
+        (1024usize, 1u64),
+        (1000, 2),
+        (4096, 3),
+        (3000, 4),
+        (5000, 5),
+    ] {
         let cfg = roomy_config(n, 6.0, 18.0);
         let params: SimParams = cfg.to_params(0.0, cfg.dt);
         let (res, pipes, swarm) = setup(ctx, &cfg, seed);
@@ -132,10 +138,8 @@ pub fn sort_matches_cpu(ctx: &GpuContext) -> Check {
                 run_end += 1;
             }
             let mut gpu_vals: Vec<u32> = got[run_start..run_end].iter().map(|k| k.val).collect();
-            let mut cpu_vals: Vec<u32> = expected[run_start..run_end]
-                .iter()
-                .map(|k| k.val)
-                .collect();
+            let mut cpu_vals: Vec<u32> =
+                expected[run_start..run_end].iter().map(|k| k.val).collect();
             gpu_vals.sort_unstable();
             cpu_vals.sort_unstable();
             if gpu_vals != cpu_vals {
@@ -407,4 +411,115 @@ pub fn long_run_matches_naive(ctx: &GpuContext) -> Check {
     } else {
         Err(problems.join("\n    "))
     }
+}
+
+/// Records one integration pass with no grid preparation and returns the resulting agents.
+///
+/// This is the shape the test below needs and no frame uses: `record_step` prepares the grid before
+/// it integrates, so the only way to reach an unprepared integration is to call `record_integrate`
+/// directly.
+fn run_integrate_only(
+    ctx: &GpuContext,
+    res: &mut SimResources,
+    pipes: &SimPipelines,
+    strategy: Strategy,
+) -> Vec<Boid> {
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("unprepared integrate"),
+        });
+    pipes.record_integrate(&mut encoder, res, strategy, &mut None);
+    ctx.queue.submit(Some(encoder.finish()));
+    res.swap();
+    let mut out: Vec<Boid> = boids_gpu::transfer::read_buffer(ctx, res.read_buffer());
+    out.truncate(res.num_boids as usize);
+    out
+}
+
+/// An unprepared grid must find no neighbours rather than read a range that was never built.
+///
+/// This is not a frame the app can reach - `record_grid_prep` always runs before `integrate_grid` -
+/// but it is the state `SimResources::new` leaves the grid in, and it is the reason a forgotten
+/// preparation is a swarm that flies in straight lines rather than one that reads `keys[0..cell_end]`
+/// for an arbitrary cell. `cell_start` being `EMPTY_CELL` everywhere is the whole guard, and
+/// `gather_grid` skipping every empty cell is the whole consequence.
+///
+/// The reference is an all-pairs step with `w_sep = w_ali = w_coh = 0`, which contributes no
+/// neighbour force whatever its search finds. If the unprepared grid matches that step, its search
+/// contributed nothing either; a stale `cell_start` pointing at a real range would move an agent by
+/// centimetres in one step, far outside the tolerance below.
+pub fn unprepared_finds_no_neighbours(ctx: &GpuContext) -> Check {
+    const N: usize = 1024;
+    const SEED: u64 = 17;
+
+    let cfg = roomy_config(N, 6.0, 18.0);
+
+    // The precondition, read straight from the buffer: allocation left every cell empty.
+    let probe = SimResources::new(ctx, &cfg);
+    let starts: Vec<u32> = boids_gpu::transfer::read_buffer(ctx, &probe.cell_start);
+    if let Some(cell) = starts.iter().position(|&s| s != EMPTY_CELL) {
+        return Err(format!(
+            "cell {cell} starts at {} instead of EMPTY_CELL after allocation, so an unprepared grid \
+             would search a range that was never built",
+            starts[cell]
+        ));
+    }
+    drop(probe);
+
+    let normal: SimParams = cfg.to_params(0.0, cfg.dt);
+    let mut unweighted = normal;
+    unweighted.w_sep = 0.0;
+    unweighted.w_ali = 0.0;
+    unweighted.w_coh = 0.0;
+    let interaction = SimConfig::idle_interaction();
+
+    let (mut res, pipes, _) = setup(ctx, &cfg, SEED);
+    res.write_params(&ctx.queue, &normal);
+    res.write_interaction(&ctx.queue, &interaction);
+    let unprepared = run_integrate_only(ctx, &mut res, &pipes, Strategy::Grid);
+
+    let (mut res, pipes, _) = setup(ctx, &cfg, SEED);
+    res.write_params(&ctx.queue, &unweighted);
+    res.write_interaction(&ctx.queue, &interaction);
+    let reference = run_integrate_only(ctx, &mut res, &pipes, Strategy::Naive);
+
+    if unprepared.len() != reference.len() {
+        return Err(format!(
+            "the unprepared grid returned {} agents and the reference {}",
+            unprepared.len(),
+            reference.len()
+        ));
+    }
+
+    let mut worst = 0.0f32;
+    let mut worst_index = 0usize;
+    for (i, (g, r)) in unprepared.iter().zip(reference.iter()).enumerate() {
+        let dv = (Vec3::from(g.vel) - Vec3::from(r.vel)).abs().max_element();
+        if dv > worst {
+            worst = dv;
+            worst_index = i;
+        }
+    }
+
+    if worst > 1e-6 {
+        let g = &unprepared[worst_index];
+        let r = &reference[worst_index];
+        return Err(format!(
+            "the unprepared grid moved differently from a step with no neighbour force; worst \
+             {worst:.4e} m/s at agent {worst_index}\n      \
+             grid   vel {:?}\n      reference vel {:?}\n      \
+             An unprepared grid must find no neighbours, because every cell is EMPTY_CELL until \
+             build_ranges runs. A difference here means cell_start was not left cleared (or was not \
+             cleared between frames), and the search read a stale range.",
+            g.vel, r.vel
+        ));
+    }
+
+    println!(
+        "\n    all {} cells empty, unprepared grid matches a step with no neighbour force (worst \
+         {worst:.2e} m/s)",
+        starts.len()
+    );
+    Ok(())
 }

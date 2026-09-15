@@ -41,24 +41,26 @@ A frame moves data in one direction. The CPU writes three small uniform structs 
                      +-------------------------------+
                                      |
   ------------------- GPU ------------------------------------------------
-  1. clear_cells        cell_start[i] = EMPTY_CELL            (day 2)
-  2. hash               keys[i] = {cell_index(pos_i), i}      (day 2)
-  3. bitonic sort       keys sorted by cell index             (day 2)
-  4. build_ranges       cell_start/cell_end per cell          (day 2)
-  5. integrate          boids[read] -> boids[write]           <- today: all-pairs
-                                     |
+  1. clear_cells        cell_start[c] = EMPTY_CELL
+  2. hash               keys[i] = {cell_index(pos_i), i}, padding -> PAD_KEY
+  3. bitonic sort       153 stages, one compute pass each, keys ascending by cell
+  4. build_ranges       cell_start / cell_end per cell
+  5. integrate          boids[read] -> boids[write]
+                                      |
                      swap ping-pong parity
-                                     |
+                                      |
   6. background pass    one full-screen triangle, no depth write
   7. agent pass         one instanced draw, depth test + write
-                                     |
+                                      |
   8. present
 ```
 
-Passes 1-4 are recorded but not yet implemented: `Strategy::Naive` skips them, and the grid buffers
-stay in their allocated state. That is deliberate rather than a stub, and
-`grid/unprepared_finds_no_neighbours` asserts it: an unprepared grid must find no neighbours rather
-than read uninitialised memory.
+Passes 1-4 build the spatial grid and are what `Strategy::Grid` records; `Strategy::Naive` skips them
+and runs an all-pairs search in pass 5 instead, which is exact and faster below the crossover in
+`boids-gpu::sim::NAIVE_AGENT_LIMIT`. The sorted keys always land in `keys[0]` (`KeyPlan`), so both grid
+consumers read one fixed group-1 binding. An unprepared grid finds no neighbours rather than wrong ones,
+because every cell starts as `EMPTY_CELL`; `grid/unprepared_finds_no_neighbours` asserts that, and the
+four `grid/*` device checks are what say the prepared one is right.
 
 ## Data ownership and the one rule
 
@@ -135,8 +137,10 @@ flocking is density-driven: against a world sized for 100k agents, a few hundred
 never see each other and every assertion about flocking would pass or fail for the wrong reason.
 
 **Device checks** (`boids-gpu/tests/gpu`). One device, main thread, sequential. Shader compilation,
-struct layout validated against `offset_of!`, and GPU-versus-CPU equality after one step and after
-600 steps.
+struct layout validated against `offset_of!`, GPU-versus-CPU equality after one step and after 600
+steps, and the grid: the sorted keys against a CPU bitonic sort, the range invariants, an unprepared
+grid finding no neighbours, and the grid search agreeing with all-pairs after one step and over a long
+run.
 
 **Render checks** (`boids-render/tests/render_suite`). Renders real frames off screen and asserts
 properties of the pixels and the depth buffer. This is the only automated way to know a picture was
@@ -149,9 +153,10 @@ because a backend cannot copy depth to a buffer is a suite people stop reading.
 
 This was developed under WSL, which shaped several decisions:
 
-* the only Vulkan adapter is `llvmpipe`, and the D3D12-backed GL adapter can compute but cannot
-  present. Adapter selection therefore happens *after* surface creation, and device limits come from
-  the adapter rather than from `downlevel_defaults()`, whose `max_texture_dimension_2d` of 2048 rejects
-  a 1440p window,
+* Vulkan enumerates only `llvmpipe` (no NVIDIA Vulkan ICD is installed even though the 4060 Ti is
+  passed through), and the GL path goes through Mesa's `d3d12` driver to the integrated Radeon but
+  cannot present. Adapter selection therefore happens *after* surface creation, and device limits come
+  from the adapter rather than from `downlevel_defaults()`, whose `max_texture_dimension_2d` of 2048
+  rejects a 1440p window,
 * `libtest`'s per-test threads crash the GL driver on device drop, hence `harness = false`,
 * GL cannot copy depth textures to buffers, hence the depth check's skip path.

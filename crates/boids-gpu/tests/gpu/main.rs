@@ -34,8 +34,8 @@ mod shaders;
 
 use std::time::Instant;
 
-use common::Check;
 use boids_gpu::context::GpuContext;
+use common::Check;
 
 fn main() {
     env_logger::builder()
@@ -121,9 +121,18 @@ type NamedCheck = (&'static str, fn(&GpuContext) -> Check);
 fn cases() -> Vec<NamedCheck> {
     vec![
         ("shaders/compile_all", shaders::compile_all),
-        ("layout/wgsl_offsets_match_rust", layout::wgsl_offsets_match_rust),
-        ("layout/struct_sizes_are_exact", layout::struct_sizes_are_exact),
-        ("reference/one_step_matches_cpu", reference::one_step_matches_cpu),
+        (
+            "layout/wgsl_offsets_match_rust",
+            layout::wgsl_offsets_match_rust,
+        ),
+        (
+            "layout/struct_sizes_are_exact",
+            layout::struct_sizes_are_exact,
+        ),
+        (
+            "reference/one_step_matches_cpu",
+            reference::one_step_matches_cpu,
+        ),
         (
             "reference/many_steps_match_cpu_aggregates",
             reference::many_steps_match_cpu_aggregates,
@@ -138,13 +147,11 @@ fn cases() -> Vec<NamedCheck> {
         ),
         ("grid/sort_matches_cpu", grid::sort_matches_cpu),
         (
-            "grid/ranges_are_consistent",
-            grid::ranges_are_consistent,
+            "grid/unprepared_finds_no_neighbours",
+            grid::unprepared_finds_no_neighbours,
         ),
+        ("grid/ranges_are_consistent", grid::ranges_are_consistent),
         ("grid/matches_naive", grid::matches_naive),
-        (
-            "grid/long_run_matches_naive",
-            grid::long_run_matches_naive,
-        ),
+        ("grid/long_run_matches_naive", grid::long_run_matches_naive),
     ]
 }

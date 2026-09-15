@@ -73,27 +73,31 @@ of the space it can see.
 
 ## Buffers
 
-| buffer | size | usage |
+| buffer | size @100k | usage |
 |---|---|---|
-| `boids[2]` | `padded_n * 48` | STORAGE, COPY_SRC, COPY_DST |
-| `keys[2]` | `padded_n * 8` | STORAGE, COPY_SRC |
-| `cell_start` | `num_cells * 4` | STORAGE, COPY_DST |
-| `cell_end` | `num_cells * 4` | STORAGE |
+| `boids[2]` | `padded_n * 48` (2 x 6.0 MB) | STORAGE, COPY_SRC, COPY_DST |
+| `keys[2]` | `padded_n * 8` (2 x 1.0 MB) | STORAGE, COPY_SRC |
+| `cell_start` | `num_cells * 4` (1.3 MB) | STORAGE, COPY_SRC, COPY_DST |
+| `cell_end` | `num_cells * 4` (1.3 MB) | STORAGE, COPY_SRC |
 | `params` | 144 | UNIFORM, COPY_DST |
 | `interaction` | 48 | UNIFORM, COPY_DST |
 | `scene` | 304 | UNIFORM, COPY_DST |
 
 `padded_n` is `num_boids` rounded up to a power of two, because the bitonic sort can only sort a
-power-of-two count. The padding agents are never integrated (every pass gates on `i < num_boids`) and
-are pushed out of the neighbour search by the sort, which gives them the maximum key.
+power-of-two count. `cell_start` is filled with `EMPTY_CELL` (`u32::MAX`) at allocation, and
+`clear_cells` re-fills it every grid frame. An empty cell must read as empty rather than as the range
+left over from the frame before, or the search would scan a previous frame's keys as neighbours.
+`cell_end` is only meaningful where `cell_start` is not `EMPTY_CELL`, and `build_ranges` overwrites
+it from scratch, so it needs no initial value.
 
-`num_cells` is `grid_dim.x * y * z`, 1,126,140 for the default fish world. The grid is a *direct*
-lookup rather than a hash, so there are no collisions and no hash table; the price is two flat arrays
-of 4.3 MB, which is a good trade on a desktop GPU.
+`cell_start` and `cell_end` carry `COPY_SRC` for the test suite, which reads the grid back to check
+the invariants `integrate_grid` searches under. Nothing in a frame copies either buffer.
 
-`cell_start` is filled with `EMPTY_CELL` (`u32::MAX`) at allocation. That is not tidiness: until the
-range-building pass exists, a grid search has to find no neighbours rather than read `keys[0..cell_end]`
-for an arbitrary cell.
+`num_cells` is `grid_dim.x * y * z`, derived from the world's bounds and perception radius by
+`GridDims::for_domain` (cell size is pinned to `r_percept`, capped at 256 cells per axis). The default
+fish world is 91 x 40 x 91 = 331,240 cells, 1.3 MB per range array. The grid is a *direct* index
+rather than a hash, so there are no collisions and no hash table, which `ADR-0003` records as a
+deliberate trade.
 
 ## Bind groups
 
@@ -103,59 +107,113 @@ for an arbitrary cell.
 |---|---|
 | 0 | `params` uniform |
 | 1 | `interaction` uniform |
-| 2 | `keys` read |
-| 3 | `cell_start` read |
-| 4 | `cell_end` read |
+| 2 | `cell_start` read_write |
+| 3 | `cell_end` read_write |
 
-**Group 1, agent storage.** Swaps every step.
+Both range arrays are declared `read_write` because `build_ranges` writes them through this group; the
+passes that only read them (`integrate_grid`) pay nothing for that. A declaration describes what the
+group *may* do, not what each pass does.
+
+**Group 1, the working pair.** Changed shape per pass, swaps every step.
 
 | binding | resource |
 |---|---|
-| 0 | `boid_src` read |
-| 1 | `boid_dst` read_write |
+| 0 | `src` read |
+| 1 | `dst` read_write |
+| 2 | `keys` read |
 
-Two bind groups exist, one per parity, created once at startup. Rebuilding a bind group per frame
-would work and would allocate a driver object sixty times a second for no reason.
+One layout serves three shapes, because they differ only in element type, which the layout does not
+describe: agents for `integrate`, agents-to-keys for `hash`, keys for the sort. Bind groups are built
+once per parity at startup, one set per shape, and the host selects between them. Rebuilding a bind
+group per frame would work and would allocate a driver object sixty times a second for no reason.
 
-`boid_src` and `boid_dst` are always distinct buffers. That is the entire reason the simulation is
-race-free: a pass only reads `src` and only writes `dst`, so the order in which invocations run does not
-matter and no barrier is needed.
+`src` and `dst` are always distinct buffers. That is the entire reason the simulation is race-free: a
+pass only reads `src` and only writes `dst`, so the order in which invocations run does not matter and
+no barrier is needed inside a pass.
+
+`keys` is binding 2 here rather than in group 0 because the sort writes it. A bind group may not bind
+one buffer read-only and read-write at once, and group 0 is bound by every pass including the 153 sort
+stages, so a read-only key array there would make the sort impossible. Pinning the sorted result to
+`keys[0]` (see `KeyPlan` below) means every consumer binds the same key buffer, and the sort's
+ping-pong stays entirely inside group 1.
 
 **Group 0, rendering.** A separate layout for the render passes: `SceneUniform` plus the agent array,
 with the agent buffer bound as a storage buffer rather than a vertex buffer. Both parities are bound up
 front for the same reason as above.
 
+## The bitonic sort and `KeyPlan`
+
+The sort is one entry point (`sort_step`) dispatched once per bitonic stage, with the stage parameters
+`(j, k, n_padded)` carried in a `var<immediate>` block and `ComputePass::set_immediates`. One pipeline,
+one bind group shape, 153 dispatches with different constants; the alternative, a dynamic-offset
+uniform array, needs a `set_bind_group` per stage and a buffer for what is 12 bytes of data.
+
+For `padded_n = 2^m` the stage count is `m * (m + 1) / 2`: `m = 17` for the 131,072-key target, so 153
+stages, one compute pass each. The passes are separate because a stage reads what the previous stage
+wrote; `wgpu` inserts the memory barrier between passes and none between two dispatches inside one.
+
+Each stage ping-pongs `keys[0]` and `keys[1]`, so which buffer holds the sorted result depends on the
+parity of the stage count: odd stages end in `keys[hash_dst]`, even in `keys[1 - hash_dst]`.
+`KeyPlan` (in `boids-gpu/src/sim.rs`) sets `hash_dst` to that parity so the hash pass writes the buffer
+that leaves the answer in `keys[0]` for either parity. This is what lets `build_ranges` and
+`integrate_grid` read one fixed buffer with no per-frame choice; the unit tests assert the invariant for
+every padded count the app can reach.
+
+The bitonic network is not stable: agents within one cell come out in an arbitrary order. Nothing
+downstream depends on the order *within* a cell - `build_ranges` only looks at run boundaries, and the
+neighbour search sums over a cell in whatever order it finds it - so the sort's contract is "partitioned
+by key, ascending" and not "stable".
+
 ## Passes
 
-### Today: `integrate_naive` (all-pairs)
+Two strategies share the whole force model (`shaders/sim/forces.wgsl`) and differ only in which
+neighbours they find, so a device test can compare them directly. `Strategy::for_count` picks one from
+the agent count; `--strategy` overrides it for an A/B comparison. Both are exact (up to floating-point
+summation order); the grid is the one that scales.
+
+### The grid (production path)
+
+`record_grid_prep` records P0-P3, then `record_integrate` records P4. Every pass is a separate compute
+pass, workgroup 256, so the barrier between passes is the synchronisation.
 
 ```
-bindings: group 0 (all), group 1 (src, dst)
+P0 clear_cells    dispatch ceil(num_cells / 256)         cell_start[c] = EMPTY_CELL
+P1 hash           dispatch ceil(padded_n / 256)          keys[dst][i] = {cell_index(pos_i), i}
+P2 sort_step      dispatch ceil(padded_n / 256), once    one bitonic stage per (k, j)
+                  per stage (m*(m+1)/2 = 153 for 131,072)
+P3 build_ranges   dispatch ceil((padded_n + 1) / 256)    cell_start / cell_end from equal-key runs
+P4 integrate_grid dispatch ceil(num_boids / 256)         27-cell neighbour search
+```
+
+The guards and the one-extra-invocation in P3 are the parts worth stating, because each exists to
+prevent a read of memory that is out of range or out of date:
+
+* `clear_cells` runs first because a cell that was populated last frame and is empty now must stop
+  being findable; `build_ranges` only writes ranges for cells that contain agents, so without the
+  clear the search would use last frame's range.
+* `hash` writes `PAD_KEY` (the `EMPTY_CELL` value, larger than any cell index) for the padding tail,
+  and `build_ranges` ignores any key `>= num_cells`. That is what keeps both the padding and any
+  stale entry out of the range arrays.
+* `build_ranges` dispatches one invocation more than it has keys: a run is closed by the first entry
+  of a *different* key, so the run that ends at the last element needs a terminator.
+* `integrate_grid` skips a cell whose `cell_start == EMPTY_CELL`; without that guard the range
+  `[EMPTY_CELL, cell_end)` would be walked as a real range.
+
+The integration pass clamps each agent's cell coordinate into the grid, so an agent pushed outside the
+domain is found by the border cells instead of falling into an out-of-range hole. That is deliberate
+and is why the grid and all-pairs comparisons in the test suite spawn away from the border.
+
+### `integrate_naive` (all-pairs)
+
+```
+bindings: group 0 (all), group 1 (src, dst, keys)
 workgroup: 256 x 1 x 1
 dispatch:  ceil(num_boids / 256)
 ```
 
-Each invocation walks every other agent, applies the squared-distance reject, and accumulates. Exact,
-and O(N^2): it exists to validate the force model against the CPU reference and to run small swarms
-where it is genuinely faster than a grid plus its sort.
-
-### Day 2: the grid
-
-```
-clear_cells    dispatch ceil(num_cells / 256)   cell_start[i] = EMPTY_CELL
-hash           dispatch ceil(padded_n / 256)    keys[i] = {cell_index(pos_i), i}
-bitonic sort   one dispatch per (k, j) stage    sort keys by key
-build_ranges   dispatch ceil(padded_n / 256)    derive cell_start / cell_end from runs of equal keys
-integrate_grid dispatch ceil(num_boids / 256)   27-cell neighbour search
-```
-
-The sort's stage parameters go through a `var<immediate>` block and `ComputePass::set_immediates`,
-which `wgpu` 30 provides and which replaces the dynamic-offset uniform array the classic
-implementation needs. One pipeline, one bind group, 153 dispatches with different constants.
-
-`integrate_grid` and `integrate_naive` share the entire force model (`shaders/sim/forces.wgsl`), so the
-only thing that can differ between them is which neighbours they find, and a test can compare the two
-directly.
+Each invocation walks every other agent, applies the squared-distance reject, and accumulates. Exact
+and O(N^2). It exists to validate the force model against the CPU reference, to run small swarms where
+it is genuinely faster than a grid plus its sort, and as the reference the grid is compared against.
 
 ### Render passes
 

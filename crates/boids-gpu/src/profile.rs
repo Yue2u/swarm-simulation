@@ -75,6 +75,96 @@ impl FrameTimings {
     }
 }
 
+/// Running mean of the per-pass GPU cost over many frames.
+///
+/// A single frame's timings are noisy enough to mislead: the first frames of a run include pipeline
+/// compilation, and any frame can be descheduled. Averaging over a few hundred frames is what makes
+/// the numbers in `docs/perf.md` worth reading, and it is also the honest way to compare two
+/// implementations.
+#[derive(Debug, Clone, Default)]
+pub struct PassAverages {
+    /// One entry per label, in first-seen order: label, summed milliseconds, summed pass count.
+    sums: Vec<(&'static str, f64, u64)>,
+    /// Frames summed, including those with no timings at all.
+    frames: u64,
+    /// Summed milliseconds of every timed pass.
+    total_millis: f64,
+}
+
+impl PassAverages {
+    /// Adds one frame's timings.
+    pub fn add(&mut self, timings: &FrameTimings) {
+        self.frames += 1;
+        self.total_millis += f64::from(timings.total_millis);
+        for total in &timings.totals {
+            match self
+                .sums
+                .iter_mut()
+                .find(|(label, _, _)| *label == total.label)
+            {
+                Some(entry) => {
+                    entry.1 += f64::from(total.millis);
+                    entry.2 += u64::from(total.passes);
+                }
+                None => self.sums.push((
+                    total.label,
+                    f64::from(total.millis),
+                    u64::from(total.passes),
+                )),
+            }
+        }
+    }
+
+    /// Frames summed.
+    #[must_use]
+    pub const fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// Mean total GPU time of the timed passes, in milliseconds.
+    #[must_use]
+    pub fn mean_total_millis(&self) -> f32 {
+        if self.frames == 0 {
+            return 0.0;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let mean = self.total_millis / self.frames as f64;
+        mean as f32
+    }
+
+    /// The table this exists for: mean time per pass name, over however many frames were summed.
+    #[must_use]
+    pub fn format_table(&self, title: &str) -> String {
+        let mut out = format!("{title} ({} frames)\n", self.frames);
+        if self.frames == 0 {
+            return out;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let frames = self.frames as f64;
+        let total = self.total_millis.max(1e-9);
+        for (label, millis, passes) in &self.sums {
+            let mean = millis / frames;
+            let calls = if *passes == self.frames {
+                "1 pass".to_string()
+            } else {
+                format!("{:>3} passes", passes / self.frames.max(1))
+            };
+            out.push_str(&format!(
+                "    {:<14} {calls}   {:>8.4} ms  {:>5.1}%\n",
+                label,
+                mean,
+                100.0 * millis / total
+            ));
+        }
+        out.push_str(&format!(
+            "    {:<14}            {:>8.4} ms\n",
+            "total",
+            self.total_millis / frames
+        ));
+        out
+    }
+}
+
 /// A timestamp profiler for the simulation's compute passes.
 ///
 /// Created once and reused every frame. When the adapter has no timestamp support this type is never

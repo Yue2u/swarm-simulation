@@ -45,6 +45,8 @@ pub struct ScreenshotRequest {
     pub camera_distance: f32,
     /// Camera elevation in radians.
     pub camera_pitch: f32,
+    /// Neighbour search to force, or `None` to pick one from the agent count.
+    pub strategy: Option<Strategy>,
 }
 
 impl Default for ScreenshotRequest {
@@ -61,6 +63,7 @@ impl Default for ScreenshotRequest {
             seed: 1,
             camera_distance: 1.1,
             camera_pitch: 0.22,
+            strategy: None,
         }
     }
 }
@@ -90,13 +93,19 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
     sim.write_params(&ctx.queue, &params);
     sim.write_interaction(&ctx.queue, &interaction);
 
+    // The same strategy the app would pick for this agent count, so a screenshot of a large swarm
+    // costs the same as it would in a window rather than going quadratic in the background.
+    #[allow(clippy::cast_possible_truncation)]
+    let strategy = request
+        .strategy
+        .unwrap_or_else(|| Strategy::for_count(config.num_boids as u32));
     let mut encoder = ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("screenshot warmup"),
         });
     for _ in 0..request.warmup_steps {
-        pipes.record_step(&mut encoder, &sim, Strategy::Naive, &mut None);
+        pipes.record_step(&mut encoder, &sim, strategy, &mut None);
         sim.swap();
     }
     ctx.queue.submit(Some(encoder.finish()));
@@ -163,7 +172,7 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
     let pixels = readback::read_texture_rgba(&ctx, &color, request.width, request.height)?;
     png::write_png_rgba(&request.path, request.width, request.height, &pixels)?;
     log::info!(
-        "wrote {} ({}x{}, {} agents, mode {:?}, {} warmup steps)",
+        "wrote {} ({}x{}, {} agents, {:?}, {strategy:?} search, {} warmup steps)",
         request.path.display(),
         request.width,
         request.height,

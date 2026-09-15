@@ -2,8 +2,8 @@
 // Pass: integration and force application. One invocation per agent.
 //
 // bindings: @group(0) 0:SimParams(uniform) 1:InteractionUniforms(uniform)
-//           2:keys(read) 3:cell_start(read) 4:cell_end(read)
-//           @group(1) 0:boid_src(read) 1:boid_dst(read_write)
+//           2:cell_start(read) 3:cell_end(read)
+//           @group(1) 0:boid_src(read) 1:boid_dst(read_write) 2:keys(read, sorted)
 // workgroup: 256 x 1 x 1
 // dispatch:  ceil(num_boids / 256)
 //
