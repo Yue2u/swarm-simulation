@@ -13,8 +13,11 @@
 //     invocation can observe another invocation's write and there is no need for any barrier,
 //   * all reads of `boid_src` happen before any write to `boid_dst` by construction of the host
 //     command buffer: the two passes are separate dispatches,
-//   * `keys` is only read by the grid variant, which requires it to have been sorted and to have
-//     had its cell ranges built earlier in the same frame.
+//   * `keys` is only read by the grid variant. It must hold the current sorted key array, which
+//     means `clear_cells`, `hash`, the bitonic stages and `build_ranges` all ran earlier in the same
+//     frame (`SimPipelines::record_step` records them in that order). Nothing in this pass can tell
+//     whether that happened: an unprepared grid finds no neighbours at all rather than wrong ones,
+//     because an uncleared `cell_start` is `EMPTY_CELL` and every cell is skipped.
 //
 // ENTRY POINTS
 //   `integrate_naive` - O(N^2) neighbour search, exact and slow. Used for GPU-vs-CPU validation
@@ -22,9 +25,10 @@
 //   `integrate_grid`  - 27-cell spatial hash search. The production path.
 //
 // Both entry points call the same force model in `sim/forces.wgsl`, so the only thing that can
-// differ between them is which neighbours they find. `tests/grid_matches_naive` asserts they agree.
+// differ between them is which neighbours they find. `grid/matches_naive` asserts they agree.
 
 //#include "sim/forces.wgsl"
+//#include "sim/agents.wgsl"
 
 // ---------------------------------------------------------------------------------------------
 // Shared step

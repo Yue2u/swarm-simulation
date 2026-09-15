@@ -285,7 +285,7 @@ impl<'a> Harness<'a> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         for _ in 0..steps {
             self.pipes
-                .record_integrate(&mut encoder, &self.sim, Strategy::Naive);
+                .record_step(&mut encoder, &self.sim, Strategy::Naive, &mut None);
             self.sim.swap();
         }
         self.ctx.queue.submit(Some(encoder.finish()));

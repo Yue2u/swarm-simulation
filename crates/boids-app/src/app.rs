@@ -17,6 +17,7 @@ use boids_core::layout::{
     CameraUniform, InteractionMode, InteractionUniforms, SceneUniform, SimMode, SimParams,
 };
 use boids_gpu::context::{GpuContext, GpuContextDescriptor, SurfaceState};
+use boids_gpu::profile::{GpuProfiler, MAX_TIMED_PASSES};
 use boids_gpu::sim::{SimPipelines, SimResources, Strategy};
 use boids_render::renderer::{FrameInput, Renderer};
 use boids_render::SceneBinding;
@@ -45,19 +46,24 @@ pub struct StartupConfig {
     /// timesteps cost a little visual smoothness and buy reproducibility, which is what makes
     /// screenshot comparison possible.
     pub deterministic: bool,
+    /// Time the simulation's compute passes with GPU timestamp queries and log a breakdown.
+    ///
+    /// Off by default because reading the timings blocks the CPU until the GPU has finished the
+    /// frame, which is a real cost in a loop that otherwise never waits. See `boids_gpu::profile`.
+    pub profile: bool,
 }
 
 impl Default for StartupConfig {
     fn default() -> Self {
         Self {
-            // 4096 rather than the 100k target: until the spatial grid is wired up the simulation
-            // runs the all-pairs path, which is O(N^2) per step and cannot hold a frame rate above
-            // roughly this many agents. The default is set to what actually runs; the flag still
-            // accepts anything, and `strategy` says what will happen.
-            num_agents: 4_096,
+            // The 100k target, and the default now that the grid exists: the all-pairs path is
+            // O(N^2) per step and cannot hold a frame rate above a few thousand agents, and
+            // `strategy` picks the grid above that crossover.
+            num_agents: 100_000,
             seed: 1,
             start_in_birds: false,
             deterministic: false,
+            profile: false,
         }
     }
 }
@@ -66,12 +72,16 @@ impl Default for StartupConfig {
 ///
 /// The crossover is not a clean analytic number: the all-pairs path does O(N) work per agent with a
 /// very low constant, while the grid does O(k) with a much higher constant plus the cost of the sort
-/// that feeds it. A few thousand agents is where they meet on the target hardware.
-///
-/// The grid path is not selectable yet: its hash, sort and range passes do not exist, so the grid
-/// would find no neighbours at all. Until they land, this constant only controls when the app warns
-/// that the simulation is about to be slow.
+/// that feeds it. A few thousand agents is where they meet; `docs/perf.md` has the measured numbers
+/// on both sides of it.
 const NAIVE_AGENT_LIMIT: u32 = 4096;
+
+/// Frames between GPU profiling reports.
+///
+/// The readback blocks until the GPU has finished the frame, so reporting every frame would make the
+/// profiler the most expensive thing in the loop. Once a second at 60 fps is enough to watch a change
+/// land.
+const PROFILE_INTERVAL_FRAMES: u64 = 60;
 
 /// Distance in front of the camera where the cursor's interaction plane is placed, as a fraction of
 /// the orbit distance. Close enough that the influence point feels attached to the cursor, far enough
@@ -98,6 +108,8 @@ pub struct BoidsApp {
     last_frame: Option<std::time::Instant>,
     /// Frames rendered since startup, for the HUD.
     frames: u64,
+    /// Per-pass GPU timing, when started with `--profile`.
+    profiler: Option<GpuProfiler>,
 }
 
 impl core::fmt::Debug for BoidsApp {
@@ -138,6 +150,7 @@ impl BoidsApp {
             smoothed_frame_time: 1.0 / 60.0,
             last_frame: None,
             frames: 0,
+            profiler: None,
         }
     }
 
@@ -172,6 +185,11 @@ impl BoidsApp {
         // simulation step writes parity 1, so the renderer never sees an uninitialised buffer.
         boids_gpu::transfer::upload_boids(&gpu.queue, &resources.boids[1], &swarm);
         let pipelines = SimPipelines::new(&gpu, &resources);
+        let profiler = if self.startup.profile {
+            GpuProfiler::new(&gpu, MAX_TIMED_PASSES, PROFILE_INTERVAL_FRAMES)
+        } else {
+            None
+        };
 
         let renderer = Renderer::new(
             &gpu,
@@ -195,25 +213,25 @@ impl BoidsApp {
         self.surface = Some(surface);
         self.sim = Some((resources, pipelines));
         self.renderer = Some(renderer);
+        self.profiler = profiler;
         self.window = Some(window);
         Ok(())
     }
 
     /// The neighbour-search strategy for the current agent count.
     ///
-    /// Always all-pairs for now, with a warning above the point where the grid would be the right
-    /// answer. Reporting the honest limitation is better than silently running an unusable frame rate
-    /// or silently producing a swarm with no interactions.
+    /// All-pairs below [`NAIVE_AGENT_LIMIT`], the grid above it. The grid builds itself from scratch
+    /// every frame (see [`SimPipelines::record_grid_prep`]) and is the only strategy that scales to
+    /// the 100k target, but it pays for a 153-stage sort per frame that a few thousand agents do not
+    /// need.
     fn strategy(&self) -> Strategy {
         #[allow(clippy::cast_possible_truncation)]
         let count = self.sim_config.num_boids as u32;
         if count > NAIVE_AGENT_LIMIT {
-            log::warn!(
-                "{count} agents exceeds the all-pairs limit of {NAIVE_AGENT_LIMIT}: the spatial grid \
-                 that would make this real-time is not wired up yet, so the frame rate will be low"
-            );
+            Strategy::Grid
+        } else {
+            Strategy::Naive
         }
-        Strategy::Naive
     }
 
     /// Rebuilds the cursor interaction uniform for this frame.
@@ -350,9 +368,28 @@ impl BoidsApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("simulation"),
             });
-        pipelines.record_integrate(&mut encoder, resources, strategy);
+        // Taken out of `self` so that the pipelines can borrow the simulation resources mutably at
+        // the same time. It goes straight back in below, whether or not timings were read.
+        let mut profiler = self.profiler.take();
+        pipelines.record_step(&mut encoder, resources, strategy, &mut profiler);
+        if let Some(profiler) = &mut profiler {
+            profiler.resolve(&mut encoder);
+        }
         gpu.queue.submit(Some(encoder.finish()));
         resources.swap();
+
+        if let Some(mut profiler) = profiler {
+            if let Some(timings) = profiler.read(gpu) {
+                log::info!(
+                    "{}",
+                    timings.format_table(&format!(
+                        "GPU compute, frame {} ({} agents, {strategy:?})",
+                        self.frames, self.sim_config.num_boids
+                    ))
+                );
+            }
+            self.profiler = Some(profiler);
+        }
 
         self.sim_time += dt;
         resources.read_index()

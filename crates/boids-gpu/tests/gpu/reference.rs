@@ -12,12 +12,14 @@
 //!   two implementations have systematically different dynamics even though each step looks right,
 //!   which is what a neglected mode-specific term looks like.
 //!
-//! The comparison uses `Strategy::Naive`, whose neighbour set is unambiguous. The grid strategy is
-//! validated separately by asserting that it finds the same neighbours as the naive one.
+//! The comparison uses `Strategy::Naive`, whose neighbour set is unambiguous, so a failure here is
+//! the force model and not the neighbour search. The grid strategy is validated against the same
+//! all-pairs path in the `grid` module: first that it finds the same neighbours, then that the two
+//! stay in step over a long run.
 
 use boids_core::config::SimConfig;
 use boids_core::layout::{EnvironmentKind, InteractionUniforms, SimParams};
-use boids_core::math::{mean_distance_to, mean_speed, order_parameter};
+use boids_core::math::{mean_speed, order_parameter};
 use boids_gpu::context::GpuContext;
 use boids_gpu::sim::Strategy;
 use glam::Vec3;
@@ -235,59 +237,4 @@ pub fn swarm_polarises_on_gpu(ctx: &GpuContext) -> Check {
     } else {
         Err(problems.join("\n    "))
     }
-}
-
-/// Asserts that an unprepared spatial grid degrades safely instead of producing garbage.
-///
-/// `cell_start` is filled with `EMPTY_CELL` at allocation, so until the range-building pass exists a
-/// grid search must find exactly zero neighbours. Without that initial clear the grid pass would read
-/// `keys[0..cell_end]` for an arbitrary cell index and consume uninitialised memory, which would show
-/// up as agents torn apart by random forces rather than as a clean "no neighbours" result.
-///
-/// When the sort lands, this check is replaced by an assertion that the grid and naive strategies find
-/// the same neighbours. Until then it is the guard that makes the unprepared state trustworthy.
-pub fn grid_unprepared_finds_no_neighbours(ctx: &GpuContext) -> Check {
-    const N: usize = 256;
-    let cfg = comparison_config(N, 6.0, 18.0);
-    let params = cfg.to_params(0.0, cfg.dt);
-    let interaction = SimConfig::idle_interaction();
-
-    let (mut res, pipes, _swarm) = setup(ctx, &cfg, 3);
-    res.write_params(&ctx.queue, &params);
-    res.write_interaction(&ctx.queue, &interaction);
-
-    // The difference between naive and grid, with the grid unprepared, must be exactly the
-    // neighbour term: the grid run should look like agents flying alone.
-    let naive = run_gpu_steps(ctx, &mut res, &pipes, Strategy::Naive, 8);
-    let grid = {
-        let (mut res2, pipes2, _) = setup(ctx, &cfg, 3);
-        res2.write_params(&ctx.queue, &params);
-        res2.write_interaction(&ctx.queue, &interaction);
-        run_gpu_steps(ctx, &mut res2, &pipes2, Strategy::Grid, 8)
-    };
-
-    let naive_order = order_parameter(&naive.iter().map(|b| Vec3::from(b.vel)).collect::<Vec<_>>());
-    let grid_order = order_parameter(&grid.iter().map(|b| Vec3::from(b.vel)).collect::<Vec<_>>());
-    let naive_spread = mean_distance_to(&naive, Vec3::ZERO);
-    let grid_spread = mean_distance_to(&grid, Vec3::ZERO);
-    if grid_spread > cfg.bounds_half.length() * 4.0 {
-        return Err(format!(
-            "the grid run scattered to a mean radius of {grid_spread:.1} m from a start of \
-             {naive_spread:.1} m; cell_start was probably not initialised to EMPTY_CELL"
-        ));
-    }
-
-    // A cell_start that was never cleared would cause the grid pass to read arbitrary key entries
-    // and produce nonsense; an empty grid leaves agents with no interactions at all.
-    if grid_order > naive_order + 0.2 {
-        return Err(format!(
-            "the grid strategy found more neighbours than the naive one before its ranges were \
-             built (grid order {grid_order:.4}, naive {naive_order:.4}); cell_start was probably not \
-             initialised to EMPTY_CELL"
-        ));
-    }
-    println!(
-        "\n    grid order {grid_order:.4} vs naive {naive_order:.4} (grid unprepared, as expected)"
-    );
-    Ok(())
 }

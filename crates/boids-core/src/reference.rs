@@ -24,7 +24,9 @@
 
 use glam::Vec3;
 
-use crate::layout::{Boid, InteractionMode, InteractionUniforms, SimMode, SimParams};
+use crate::layout::{
+    Boid, InteractionMode, InteractionUniforms, KeyVal, SimMode, SimParams,
+};
 use crate::math::{clamp_len, clamp_len_range};
 
 /// A `[0,1)` value derived from an integer hash, matching `hash_to_unit` in the shaders.
@@ -490,6 +492,21 @@ mod tests {
         let after = crate::math::mean_distance_to(&boids, focus);
         assert!(after > before, "repeller did not push: {before} -> {after}");
     }
+}
+
+/// Ascending sort of a key array by [`KeyVal::key`], the specification for the GPU bitonic sort.
+///
+/// A comparison sort from the standard library rather than a hand-written bitonic sort, on purpose:
+/// reproducing the GPU's algorithm on the CPU would reproduce its bugs too, and the only thing this
+/// function is for is being independently right.
+///
+/// Ties on `key` - two agents in the same cell - are ordered by `val` here and arbitrarily on the
+/// GPU, because the bitonic network is not stable. Callers must not depend on the order *within* a
+/// cell, and a comparison against the GPU result has to allow for it. Breaking ties by `val` is what
+/// makes this side of that comparison deterministic, so a failure is reproducible rather than
+/// dependent on the driver's scheduling.
+pub fn sort_keys(keys: &mut [KeyVal]) {
+    keys.sort_unstable_by_key(|k| (k.key, k.val));
 }
 
 #[cfg(test)]

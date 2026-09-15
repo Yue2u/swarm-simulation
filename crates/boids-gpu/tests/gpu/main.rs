@@ -26,6 +26,8 @@
 //! ```
 
 mod common;
+mod grid;
+mod immediates;
 mod layout;
 mod reference;
 mod shaders;
@@ -131,8 +133,18 @@ fn cases() -> Vec<NamedCheck> {
             reference::swarm_polarises_on_gpu,
         ),
         (
-            "grid/unprepared_finds_no_neighbours",
-            reference::grid_unprepared_finds_no_neighbours,
+            "sort/immediates_reach_the_shader",
+            immediates::immediates_reach_the_shader,
+        ),
+        ("grid/sort_matches_cpu", grid::sort_matches_cpu),
+        (
+            "grid/ranges_are_consistent",
+            grid::ranges_are_consistent,
+        ),
+        ("grid/matches_naive", grid::matches_naive),
+        (
+            "grid/long_run_matches_naive",
+            grid::long_run_matches_naive,
         ),
     ]
 }

@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use boids_core::layout::Boid;
+use boids_core::layout::{Boid, KeyVal};
 use boids_gpu::context::{GpuContext, GpuContextDescriptor};
 use boids_gpu::sim::{SimPipelines, SimResources, Strategy};
 
@@ -82,7 +82,7 @@ pub fn run_gpu_steps(
             label: Some("gpu test steps"),
         });
     for _ in 0..steps {
-        pipes.record_integrate(&mut encoder, res, strategy);
+        pipes.record_step(&mut encoder, res, strategy, &mut None);
         res.swap();
     }
     ctx.queue.submit(Some(encoder.finish()));
@@ -103,4 +103,39 @@ pub fn setup(
     boids_gpu::transfer::upload_boids(&ctx.queue, &res.boids[0], &swarm);
     let pipes = SimPipelines::new(ctx, &res);
     (res, pipes, swarm)
+}
+
+/// The grid after a preparation pass, as the CPU can see it.
+pub struct GridState {
+    /// Every sort key, sorted by cell index, `padded_n` entries long.
+    pub keys: Vec<KeyVal>,
+    /// First index of each cell's run, or `boids_core::layout::EMPTY_CELL`.
+    pub cell_start: Vec<u32>,
+    /// One past the last index of each cell's run.
+    pub cell_end: Vec<u32>,
+}
+
+/// Runs the grid preparation passes once and reads the result back.
+///
+/// The caller must have uploaded `SimParams` first: the hash pass reads the grid geometry from them.
+/// This is the same sequence `SimPipelines::record_step` records for a grid frame, minus the
+/// integration, so what it returns is what the integration pass would have searched.
+pub fn run_grid_prep(
+    ctx: &GpuContext,
+    res: &SimResources,
+    pipes: &SimPipelines,
+) -> GridState {
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu test grid prep"),
+        });
+    pipes.record_grid_prep(&mut encoder, res, &mut None);
+    ctx.queue.submit(Some(encoder.finish()));
+
+    GridState {
+        keys: boids_gpu::transfer::read_buffer(ctx, res.sorted_keys()),
+        cell_start: boids_gpu::transfer::read_buffer(ctx, &res.cell_start),
+        cell_end: boids_gpu::transfer::read_buffer(ctx, &res.cell_end),
+    }
 }

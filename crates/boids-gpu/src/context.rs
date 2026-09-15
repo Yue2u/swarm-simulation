@@ -164,6 +164,10 @@ impl GpuContext {
                 .max_storage_buffers_per_shader_stage
                 .max(8),
             max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
+            // Zero in `Limits::default()`, and a non-zero `max_immediate_size` is what the sort's
+            // `var<immediate>` needs. The adapter offers 256 bytes on GL and the Vulkan push-constant
+            // size otherwise; the sort asks for 16.
+            max_immediate_size: adapter_limits.max_immediate_size,
             ..wgpu::Limits::default()
         };
 
@@ -173,6 +177,18 @@ impl GpuContext {
             features |= wgpu::Features::TIMESTAMP_QUERY;
             timestamps_enabled = true;
         }
+        // Carries the bitonic sort's per-stage parameters (see `shaders/sim/sort.wgsl`). Every backend
+        // `wgpu` implements reports it, so this is a guard against a future one that does not, not a
+        // portable fallback: without it there is no sort, and without the sort there is no 100k-agent
+        // frame. Failing at startup with that sentence beats rendering an empty grid.
+        if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
+            return Err(
+                "the adapter does not support IMMEDIATES, which the bitonic sort carries its stage \
+                 parameters in"
+                    .to_string(),
+            );
+        }
+        features |= wgpu::Features::IMMEDIATES;
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("boids device"),
@@ -193,10 +209,12 @@ impl GpuContext {
         }));
 
         log::info!(
-            "limits: max_storage_binding={} MiB max_buffer={} MiB max_workgroups={} timestamps={}",
+            "limits: max_storage_binding={} MiB max_buffer={} MiB max_workgroups={} \
+             max_immediates={} timestamps={}",
             limits.max_storage_buffer_binding_size / (1 << 20),
             limits.max_buffer_size / (1 << 20),
             limits.max_compute_workgroups_per_dimension,
+            limits.max_immediate_size,
             timestamps_enabled
         );
 

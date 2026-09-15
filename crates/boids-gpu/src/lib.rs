@@ -14,26 +14,33 @@
 //! # Frame structure
 //!
 //! ```text
-//! P0 clear_cells    cell_start[i] = EMPTY_CELL
-//! P1 hash           keys[i] = {cell_index(pos_i), i}
-//! P2 sort           bitonic sort of keys by cell index
+//! P0 clear_cells    cell_start[c] = EMPTY_CELL
+//! P1 hash           keys[dst][i] = {cell_index(pos_i), i}, padding -> PAD_KEY
+//! P2 sort           bitonic sort of keys by cell index, one pass per stage, parameters in immediates
 //! P3 build_ranges   cell_start/cell_end from the sorted keys
 //! P4 integrate      neighbour search over 27 cells -> forces -> integration
 //! ```
 //!
-//! `record_frame` records P0..P4 and returns the index of the agent buffer that now holds the
-//! updated state. The renderer draws from that buffer while the next frame writes into the other
-//! one, so a frame in flight never reads a buffer that is being written.
+//! `SimPipelines::record_step` records P0..P4 for one step; `SimResources::swap` then flips the
+//! ping-pong parity, so the renderer draws from the buffer the step just wrote while the next step
+//! writes into the other one. A frame in flight never reads a buffer that is being written.
+//!
+//! The all-pairs strategy skips P0..P3: it needs no grid, and below a few thousand agents it is
+//! faster than paying for the sort that feeds one.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations)]
 
 pub mod context;
 pub mod mesh_profile;
+pub mod profile;
 pub mod sim;
 pub mod transfer;
 
 pub use context::{GpuContext, GpuContextDescriptor, SurfaceState};
 pub use mesh_profile::{mesh_profile, scene_uniform};
-pub use sim::{dispatch_size, SimPipelines, SimResources, Strategy};
+pub use profile::{FrameTimings, GpuProfiler, PassTotal, MAX_TIMED_PASSES};
+pub use sim::{
+    dispatch_size, key_plan, sort_stages, KeyPlan, SimPipelines, SimResources, Strategy,
+};
 pub use transfer::{read_buffer, read_raw, upload_boids, upload_uniform};

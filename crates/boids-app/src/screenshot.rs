@@ -96,7 +96,7 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
             label: Some("screenshot warmup"),
         });
     for _ in 0..request.warmup_steps {
-        pipes.record_integrate(&mut encoder, &sim, Strategy::Naive);
+        pipes.record_step(&mut encoder, &sim, Strategy::Naive, &mut None);
         sim.swap();
     }
     ctx.queue.submit(Some(encoder.finish()));

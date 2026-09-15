@@ -100,6 +100,7 @@ fn cli_config() -> (app::StartupConfig, Option<screenshot::ScreenshotRequest>) {
             "--birds" => config.start_in_birds = true,
             "--fish" => config.start_in_birds = false,
             "--deterministic" => config.deterministic = true,
+            "--profile" => config.profile = true,
             "--help" | "-h" => {
                 println!(
                     "boids - GPU flocking simulation\n\n\
@@ -110,6 +111,7 @@ fn cli_config() -> (app::StartupConfig, Option<screenshot::ScreenshotRequest>) {
                      --fish             start in the underwater world (default)\n    \
                      --birds            start in the sky world\n    \
                      --deterministic    fixed timestep, for screenshot comparison\n    \
+                     --profile          log per-pass GPU timings once a second\n    \
                      --screenshot <f>   render one frame headlessly to a PNG and exit\n    \
                      -h, --help         print this help\n\n\
                      CONTROLS:\n    \

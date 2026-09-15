@@ -153,9 +153,14 @@ impl SimConfig {
             SimMode::Fish => (Vec3::new(160.0, 70.0, 160.0), 3.5, 14.0, 0.15, 0.35),
             SimMode::Birds => (Vec3::new(600.0, 220.0, 600.0), 14.0, 32.0, -0.05, 0.12),
         };
-        // Cell size tracks the perception radius: near-neighbour search then only needs the 27
-        // cells around a boid, which is what makes the grid worth its cost.
-        let grid = GridDims::for_domain(bounds_half, 2.0 * r_percept / 3.0, 256);
+        // Cell size *is* the perception radius, and that is a correctness requirement rather than a
+        // tuning choice: the neighbour search visits the 27 cells around an agent, and that box
+        // contains a ball of radius `cell_size` around it whichever cell face the agent is nearest.
+        // A cell smaller than `r_percept` therefore loses every neighbour between `cell_size` and
+        // `r_percept` that lies beyond a cell face, which is a swarm that flocks slightly wrong
+        // rather than a crash. `grid/mod.rs`-level test `grid/matches_naive` exists because this is
+        // exactly the mistake that is invisible from the outside.
+        let grid = GridDims::for_domain(bounds_half, r_percept, 256);
         // The safety margin must be at least the distance needed to stop from cruise speed at the
         // avoidance force limit, otherwise agents tunnel through thin terrain: they enter the
         // smoothstep band already moving faster than it can arrest. This is the single most
@@ -223,7 +228,7 @@ impl SimConfig {
         cfg.max_speed = 6.0;
         cfg.min_speed = 2.0;
         cfg.max_force = 18.0;
-        cfg.grid = GridDims::for_domain(cfg.bounds_half, 2.0 * r_percept / 3.0, 64);
+        cfg.grid = GridDims::for_domain(cfg.bounds_half, r_percept, 64);
         cfg
     }
 
@@ -323,12 +328,54 @@ mod tests {
         assert_eq!(grid.flatten([3, 2, 1]), 23);
     }
 
+    /// The cell must be at least the perception radius, or the 27-cell search is incomplete.
+    ///
+    /// Checked for every world the app can start in and for the test/demo worlds, because the failure
+    /// mode is a swarm that is subtly wrong rather than one that breaks: the grid simply never sees
+    /// the neighbours between `cell_size` and `r_percept` that lie across a cell face.
     #[test]
-    fn cell_size_follows_perception_radius() {
-        let fish = SimConfig::for_mode(SimMode::Fish, 1000);
-        assert!((fish.grid.cell_size - 2.0 * fish.r_percept / 3.0).abs() < 1e-6);
-        let p = fish.to_params(0.0, fish.dt);
-        assert_eq!(p.num_boids, 1000);
-        assert_eq!(p.mode, SimMode::Fish.as_u32());
+    fn cell_size_is_at_least_the_perception_radius() {
+        let worlds = [
+            SimConfig::for_mode(SimMode::Fish, 1000),
+            SimConfig::for_mode(SimMode::Birds, 1000),
+            SimConfig::for_mode(SimMode::Fish, 100_000),
+            SimConfig::dense(1024, 6.0, 18.0),
+            SimConfig::dense(500, 6.0, 18.0),
+        ];
+        for cfg in worlds {
+            assert!(
+                cfg.grid.cell_size >= cfg.r_percept,
+                "{:?} world: cell {} is smaller than the perception radius {}",
+                cfg.mode,
+                cfg.grid.cell_size,
+                cfg.r_percept
+            );
+        }
+    }
+
+    /// The grid has to cover the box the agents are steered inside of, to within one cell.
+    ///
+    /// `cell_of` clamps, so an agent outside the grid is not an error - it lands in the outermost
+    /// cell and the 27-cell search reaches its neighbours anyway, as long as the shortfall is at most
+    /// the one cell the clamp folds in. More than that and a row of agents piles into the border cell
+    /// and searches a neighbourhood that does not contain where they actually are.
+    #[test]
+    fn grid_covers_the_steering_domain() {
+        for mode in [SimMode::Fish, SimMode::Birds] {
+            let cfg = SimConfig::for_mode(mode, 1000);
+            #[allow(clippy::cast_precision_loss)]
+            let extent = Vec3::new(
+                cfg.grid.dim[0] as f32 * cfg.grid.cell_size,
+                cfg.grid.dim[1] as f32 * cfg.grid.cell_size,
+                cfg.grid.dim[2] as f32 * cfg.grid.cell_size,
+            );
+            let shortfall = cfg.bounds_half * 2.0 - extent;
+            assert!(
+                shortfall.max_element() <= cfg.grid.cell_size,
+                "{mode:?}: the grid spans {extent:?} against bounds {:?}, so an agent can be more \
+                 than one cell outside it",
+                cfg.bounds_half * 2.0
+            );
+        }
     }
 }
