@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/boids-core",
+    "crates/boids-gpu",
+    "crates/boids-scene",
+    "crates/boids-render",
+    "crates/boids-app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+boids-core = { path = "crates/boids-core" }
+boids-gpu = { path = "crates/boids-gpu" }
+boids-scene = { path = "crates/boids-scene" }
+boids-render = { path = "crates/boids-render" }
+
+bytemuck = { version = "1.24", features = ["derive"] }
+glam = { version = "0.33", features = ["bytemuck"] }
+wgpu = "30.0"
+winit = "0.30"
+log = "0.4"
+env_logger = "0.11"
+pollster = "0.4"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

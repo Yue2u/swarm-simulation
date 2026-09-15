@@ -1,0 +1,25 @@
+[package]
+name = "boids-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "boids"
+path = "src/main.rs"
+
+[dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+log.workspace = true
+env_logger.workspace = true
+pollster.workspace = true
+boids-core.workspace = true
+boids-gpu.workspace = true
+boids-scene.workspace = true
+boids-render.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

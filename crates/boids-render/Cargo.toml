@@ -1,0 +1,16 @@
+[package]
+name = "boids-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+wgpu.workspace = true
+log.workspace = true
+boids-core.workspace = true
+boids-scene.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
