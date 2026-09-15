@@ -309,67 +309,22 @@ mod tests {
     use crate::config::SimConfig;
     use crate::layout::Boid;
 
+    /// Spawns `n` agents uniformly in a box, delegating to the shared spawn so that the reference
+    /// tests and the GPU tests start from identical state.
     fn spawn(n: usize, seed: u64, half: Vec3, speed: f32) -> Vec<Boid> {
-        let mut rng = crate::rng::Pcg32::new(seed, 1);
-        (0..n)
-            .map(|_| {
-                let dir = rng.unit_vector();
-                Boid {
-                    pos: rng.in_box(half * 0.6).to_array(),
-                    species: rng.next_f32(),
-                    vel: (dir * rng.range(speed * 0.8, speed * 1.2)).to_array(),
-                    phase: rng.range(0.0, core::f32::consts::TAU),
-                    prev_dir: dir.to_array(),
-                    color_seed: rng.next_f32(),
-                }
-            })
-            .collect()
+        let mut cfg = SimConfig::for_mode(SimMode::Fish, n);
+        cfg.bounds_half = half / 0.6;
+        cfg.min_speed = speed * 0.5;
+        cfg.max_speed = speed;
+        crate::spawn::spawn_swarm(&cfg, seed)
     }
 
     /// Spawns agents in a shell between `inner` and `outer` metres from the origin.
     ///
     /// Used by the obstacle tests: spawning uniformly in a box would put a random subset of agents
     /// *inside* the obstacle, which makes a penetration assertion meaningless.
-    pub(super) fn spawn_shell(n: usize, seed: u64, inner: f32, outer: f32, speed: f32) -> Vec<Boid> {
-        let mut rng = crate::rng::Pcg32::new(seed, 2);
-        (0..n)
-            .map(|_| {
-                let dir = rng.unit_vector();
-                let r = rng.range(inner, outer);
-                let vel_dir = rng.unit_vector();
-                Boid {
-                    pos: (dir * r).to_array(),
-                    species: rng.next_f32(),
-                    vel: (vel_dir * rng.range(speed * 0.8, speed * 1.2)).to_array(),
-                    phase: rng.range(0.0, core::f32::consts::TAU),
-                    prev_dir: vel_dir.to_array(),
-                    color_seed: rng.next_f32(),
-                }
-            })
-            .collect()
-    }
-
-    /// Builds a config whose density gives roughly `neighbours` agents inside a perception sphere.
-    ///
-    /// Boids is a *density*-driven behaviour: against the default world sizes, which are sized for
-    /// tens of thousands of agents, a few hundred test agents would never see each other at all,
-    /// and every assertion about flocking would pass or fail for the wrong reason. So the unit
-    /// tests shrink the world instead of shrinking the flock.
-    fn dense_world(n: usize, r_percept: f32, neighbours: f32) -> SimConfig {
-        #[allow(clippy::cast_precision_loss)]
-        let n_f = n as f32 - 1.0;
-        let sphere = 4.0 / 3.0 * core::f32::consts::PI * r_percept.powi(3);
-        let volume = n_f * sphere / neighbours;
-        let half = (volume / 8.0).cbrt();
-        let mut cfg = SimConfig::for_mode(SimMode::Birds, n);
-        cfg.r_percept = r_percept;
-        cfg.r_sep = r_percept * 0.35;
-        cfg.bounds_half = Vec3::splat(half);
-        cfg.max_speed = 6.0;
-        cfg.min_speed = 2.0;
-        cfg.max_force = 18.0;
-        cfg.grid = crate::config::GridDims::for_domain(cfg.bounds_half, 2.0 * r_percept / 3.0, 64);
-        cfg
+    fn spawn_shell(n: usize, seed: u64, inner: f32, outer: f32, speed: f32) -> Vec<Boid> {
+        crate::spawn::spawn_shell(n, seed, inner, outer, speed * 0.5, speed)
     }
 
     #[test]
@@ -401,7 +356,7 @@ mod tests {
     fn swarm_polarises_without_perturbation() {
         // The core emergent behaviour: a set of agents that can only see each other should
         // spontaneously align. If this fails, the force signs are wrong.
-        let mut cfg = dense_world(500, 6.0, 18.0);
+        let mut cfg = SimConfig::dense(500, 6.0, 18.0);
         cfg.wander = 0.0;
         cfg.buoyancy = 0.0;
         let inter = SimConfig::idle_interaction();
@@ -489,8 +444,9 @@ mod tests {
             .iter()
             .filter(|b| obstacle(Vec3::from(b.pos)) > 0.0)
             .count();
-        assert!(
-            outside == boids.len(),
+        assert_eq!(
+            outside,
+            boids.len(),
             "{} of {} agents stayed inside the obstacle",
             boids.len() - outside,
             boids.len()
@@ -540,7 +496,6 @@ mod tests {
 mod debug_probe {
     use super::*;
     use crate::config::SimConfig;
-    use crate::reference::tests::spawn_shell;
 
     #[test]
     #[ignore = "manual diagnostic, run with --ignored --nocapture"]
@@ -548,7 +503,7 @@ mod debug_probe {
         let cfg = SimConfig::for_mode(SimMode::Fish, 200);
         let inter = SimConfig::idle_interaction();
         let obstacle = |p: Vec3| crate::sdf::sphere(p, Vec3::ZERO, 25.0);
-        let mut boids = spawn_shell(200, 5, 30.0, 60.0, cfg.max_speed);
+        let mut boids = crate::spawn::spawn_shell(200, 5, 30.0, 60.0, cfg.min_speed, cfg.max_speed);
         let params = cfg.to_params(0.0, cfg.dt);
         println!("r_safe={} probe={} strength={} max_force={} r_percept={}",
             params.r_safe, params.sdf_probe, params.sdf_strength, params.max_force, params.r_percept);

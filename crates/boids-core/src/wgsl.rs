@@ -298,7 +298,7 @@ mod tests {
             let c = l.compile(name).unwrap_or_else(|e| panic!("compiling {name}: {e}"));
             assert!(!c.source.contains("//#include"), "{name} left an unresolved include");
             assert!(
-                c.sources.len() >= 1,
+                !c.sources.is_empty(),
                 "{name} produced no provenance information"
             );
         }

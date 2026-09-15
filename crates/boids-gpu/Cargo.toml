@@ -8,8 +8,16 @@ license.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 wgpu.workspace = true
+pollster.workspace = true
 log.workspace = true
 boids-core.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+
+[[test]]
+name = "gpu"
+path = "tests/gpu/main.rs"
+harness = false

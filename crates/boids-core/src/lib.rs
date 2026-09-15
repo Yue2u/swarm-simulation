@@ -21,6 +21,7 @@ pub mod math;
 pub mod reference;
 pub mod rng;
 pub mod sdf;
+pub mod spawn;
 pub mod terrain;
 pub mod wgsl;
 
@@ -32,3 +33,4 @@ pub use layout::{
 };
 pub use math::{clamp_len, order_parameter, smoothstep};
 pub use rng::Pcg32;
+pub use spawn::{spawn_shell, spawn_swarm, validation_issues};

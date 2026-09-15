@@ -212,9 +212,10 @@ fn vs_main(
     }
 
     // Scale the mesh by the agent's speed so that a fast agent is drawn slightly stretched, which
-    // reads as motion without needing any motion blur.
+    // reads as motion without needing any motion blur. `speed_ref` comes from the same config that
+    // drives the simulation, so the stretch factor can never disagree with the physics.
     let speed = length(b.vel);
-    let stretch = 1.0 + 0.18 * clamp(speed / max(params_max_speed_proxy(), 1e-3), 0.0, 1.5);
+    let stretch = 1.0 + 0.18 * clamp(speed / max(m.speed_ref, 1e-3), 0.0, 1.5);
     local.z = local.z * stretch;
 
     let world = b.pos + basis * local;

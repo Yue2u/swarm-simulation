@@ -33,7 +33,7 @@
 // Applies the force model to one agent and writes the result.
 //
 // `acc` must already contain the neighbour statistics from whichever search strategy was used.
-fn integrate_agent(i: u32, acc: NeighbourAccum) -> void {
+fn integrate_agent(i: u32, acc: NeighbourAccum) {
     let src = boid_src[i];
     let pos = src.pos;
     let vel = src.vel;

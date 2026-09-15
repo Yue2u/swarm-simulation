@@ -197,6 +197,36 @@ impl SimConfig {
         }
     }
 
+    /// Builds a world sized so that `n` agents produce roughly `neighbours` agents inside one
+    /// perception sphere.
+    ///
+    /// Flocking is a *density*-driven behaviour. Against the default world sizes, which are sized for
+    /// tens of thousands of agents, a few hundred agents would never see each other at all, and every
+    /// assertion about flocking would pass or fail for the wrong reason: a "the swarm polarised"
+    /// check would measure nothing, and a "the GPU matches the CPU" check would compare two identical
+    /// empty results.
+    ///
+    /// So the small-N tests and the demo scene shrink the *world*, keeping the perception radius and
+    /// the speed sensible relative to it, rather than shrinking the flock's interaction radius.
+    #[must_use]
+    pub fn dense(n: usize, r_percept: f32, neighbours: f32) -> Self {
+        #[allow(clippy::cast_precision_loss)]
+        let n_f = (n as f32 - 1.0).max(1.0);
+        let sphere = 4.0 / 3.0 * core::f32::consts::PI * r_percept.powi(3);
+        let volume = n_f * sphere / neighbours.max(0.1);
+        let half = (volume / 8.0).cbrt();
+
+        let mut cfg = Self::for_mode(SimMode::Birds, n);
+        cfg.r_percept = r_percept;
+        cfg.r_sep = r_percept * 0.35;
+        cfg.bounds_half = Vec3::splat(half);
+        cfg.max_speed = 6.0;
+        cfg.min_speed = 2.0;
+        cfg.max_force = 18.0;
+        cfg.grid = GridDims::for_domain(cfg.bounds_half, 2.0 * r_percept / 3.0, 64);
+        cfg
+    }
+
     /// Perception radius used by the shaders.
     #[must_use]
     pub fn radius(&self) -> f32 {
