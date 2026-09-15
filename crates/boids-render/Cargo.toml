@@ -10,7 +10,15 @@ glam.workspace = true
 wgpu.workspace = true
 log.workspace = true
 boids-core.workspace = true
+boids-gpu.workspace = true
 boids-scene.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+
+[[test]]
+name = "render_suite"
+path = "tests/render_suite/main.rs"
+harness = false

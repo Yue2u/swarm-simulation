@@ -204,7 +204,10 @@ fn vs_main(
     let right = basis[0];
     let up = basis[1];
 
-    var local = animate_local(mesh_vertex(vi, m), b.phase, m);
+    // Animate in unit space, then scale: the animation displacements are proportional to the local
+    // geometry, so scaling afterwards keeps them proportional instead of leaving a fixed-metric wiggle
+    // on a scaled body.
+    var local = animate_local(mesh_vertex(vi, m), b.phase, m) * m.scale;
 
     let bank = bank_angle(b.prev_dir, fwd, right);
     if (abs(bank) > 1e-4) {

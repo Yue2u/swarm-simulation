@@ -258,8 +258,10 @@ name = "boids-render"
 version = "0.1.0"
 dependencies = [
  "boids-core",
+ "boids-gpu",
  "boids-scene",
  "bytemuck",
+ "env_logger",
  "glam",
  "log",
  "pollster",

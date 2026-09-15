@@ -320,12 +320,17 @@ pub struct MeshParams {
 
     /// Reference speed for the motion-stretch term, usually the simulation's `max_speed`.
     pub speed_ref: f32,
-    /// Explicit padding keeping the struct 80 bytes.
+    /// Uniform scale applied to the whole mesh.
+    ///
+    /// Without it every agent would be drawn at the same absolute size, which reads as dust in a world
+    /// sized for a hundred thousand agents and as a solid wall in a small one. The host derives it from
+    /// the perception radius, so an agent always occupies a similar share of the space it can see.
+    pub scale: f32,
+    /// Explicit padding keeping the struct 80 bytes, and keeping it free of implicit padding so that
+    /// `bytemuck` will derive `Pod`: every 16-byte block must be exactly full.
     pub _pad_a: f32,
-    /// Explicit padding keeping the struct 80 bytes.
+    /// Explicit padding, see `_pad_a`.
     pub _pad_b: f32,
-    /// Explicit padding keeping the struct 80 bytes.
-    pub _pad_c: f32,
 }
 
 /// Everything the render passes need for one frame.

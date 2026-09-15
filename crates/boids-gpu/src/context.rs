@@ -36,6 +36,11 @@ impl Default for GpuContextDescriptor {
 
 /// Instance, adapter, device, queue and the shared shader loader.
 pub struct GpuContext {
+    /// The instance the adapter and device came from.
+    ///
+    /// Kept alive for the lifetime of the context even though the surfaces hold their own reference:
+    /// it costs nothing, and it keeps the door open for a second window (a side-by-side A/B of the two
+    /// worlds) without having to thread an `Instance` through the app.
     instance: wgpu::Instance,
     /// The chosen adapter.
     pub adapter: wgpu::Adapter,
@@ -61,21 +66,65 @@ impl core::fmt::Debug for GpuContext {
 }
 
 impl GpuContext {
-    /// Requests an adapter and device without a surface.
+    /// Requests an adapter and device without a surface, for headless use.
     ///
-    /// Used by the headless tests and by the app before the window exists.
+    /// Used by the tests and by any future offline pass. For a window, use
+    /// [`GpuContext::new_with_window`] instead: it picks an adapter that can actually present.
     ///
     /// # Errors
     /// Returns a description when no adapter matches or the device request fails.
     pub fn new(desc: &GpuContextDescriptor) -> Result<Self, String> {
+        Self::create(desc, None)
+    }
+
+    /// Requests an adapter, device and surface for a window, in the order the API requires.
+    ///
+    /// The window target must be passed *before* the adapter is chosen, because an adapter is only
+    /// useful if it can present to that surface. Asking for an adapter first and a surface second
+    /// works on machines with a single adapter and fails on every machine with two: this development
+    /// environment has a GL adapter that computes fine but cannot present at all, and picking it
+    /// produced "adapter offers no surface formats" at startup.
+    ///
+    /// # Errors
+    /// Returns a description when the surface cannot be created, no adapter can present to it, or the
+    /// device request fails.
+    pub fn new_with_window(
+        desc: &GpuContextDescriptor,
+        target: impl Into<wgpu::SurfaceTarget<'static>>,
+        width: u32,
+        height: u32,
+    ) -> Result<(Self, SurfaceState), String> {
+        let instance = Self::create_instance(desc);
+        let surface = instance
+            .create_surface(target)
+            .map_err(|e| format!("surface creation failed: {e}"))?;
+        let ctx = Self::create_with_instance(desc, instance, Some(&surface))?;
+        let state = SurfaceState::configure(&ctx, surface, width, height)?;
+        Ok((ctx, state))
+    }
+
+    fn create_instance(desc: &GpuContextDescriptor) -> wgpu::Instance {
         // `new_without_display_handle` rather than a struct literal: `InstanceDescriptor` is
-        // non-exhaustive and constructing it by hand would break on every wgpu minor bump. A
-        // display handle is only needed to present through GLES on Wayland, which is not a target
-        // here; the Vulkan path ignores it.
+        // non-exhaustive and constructing it by hand would break on every wgpu minor bump. A display
+        // handle is only needed to present through GLES on Wayland, which is not a target here.
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_desc.backends = desc.force_backends.unwrap_or_else(wgpu::Backends::all);
-        let instance = wgpu::Instance::new(instance_desc);
+        wgpu::Instance::new(instance_desc)
+    }
 
+    fn create(
+        desc: &GpuContextDescriptor,
+        compatible: Option<&wgpu::Surface<'_>>,
+    ) -> Result<Self, String> {
+        let instance = Self::create_instance(desc);
+        Self::create_with_instance(desc, instance, compatible)
+    }
+
+    fn create_with_instance(
+        desc: &GpuContextDescriptor,
+        instance: wgpu::Instance,
+        compatible: Option<&wgpu::Surface<'_>>,
+    ) -> Result<Self, String> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: if desc.high_performance {
                 wgpu::PowerPreference::HighPerformance
@@ -83,9 +132,9 @@ impl GpuContext {
                 wgpu::PowerPreference::LowPower
             },
             force_fallback_adapter: desc.force_fallback,
-            compatible_surface: None,
-            // Disable limit buckets: the bucket rounding can silently give a device fewer resources
-            // than requested, which would only show up as a failure at high agent counts.
+            compatible_surface: compatible,
+            // Disable limit buckets: bucket rounding can silently hand back a device with fewer
+            // resources than asked for, which would only show up as a failure at high agent counts.
             apply_limit_buckets: false,
         }))
         .map_err(|e| format!("no suitable adapter: {e}"))?;
@@ -100,10 +149,13 @@ impl GpuContext {
             info.driver_info
         );
 
-        // Start from `downlevel_defaults` so the app also runs on a WebGL-class backend, then raise
-        // the storage limits to whatever the adapter actually offers. The spatial grid needs a large
-        // storage binding and a 100k-agent buffer is 4.8 MB, so keeping the downlevel defaults for
-        // those two limits would fail only at high agent counts, which is the worst time to find out.
+        // Start from the desktop defaults and then take what the adapter actually offers.
+        //
+        // Do NOT start from `downlevel_defaults()`: it caps `max_texture_dimension_2d` at 2048, and
+        // that cap becomes a property of the *device*, so `Surface::configure` rejects any window
+        // wider than 2048 pixels with a validation error. A 1440p window is 2560 wide, which is the
+        // project's reference resolution. The same applies to `max_buffer_size` for a 100k-agent
+        // buffer, so both are taken from the adapter instead of assumed.
         let adapter_limits = adapter.limits();
         let limits = wgpu::Limits {
             max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
@@ -111,7 +163,8 @@ impl GpuContext {
             max_storage_buffers_per_shader_stage: adapter_limits
                 .max_storage_buffers_per_shader_stage
                 .max(8),
-            ..wgpu::Limits::downlevel_defaults()
+            max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
+            ..wgpu::Limits::default()
         };
 
         let mut features = wgpu::Features::empty();
@@ -189,25 +242,10 @@ impl GpuContext {
             })
     }
 
-    /// Creates and configures a surface for a window.
-    ///
-    /// `target` is normally an `Arc<winit::window::Window>`; taking it generically keeps `winit` out
-    /// of this crate.
-    ///
-    /// # Errors
-    /// Returns a description when the adapter cannot present to this surface, or when configuring
-    /// the chosen format fails.
-    pub fn create_surface(
-        &self,
-        target: impl Into<wgpu::SurfaceTarget<'static>>,
-        width: u32,
-        height: u32,
-    ) -> Result<SurfaceState, String> {
-        let surface = self
-            .instance
-            .create_surface(target)
-            .map_err(|e| format!("surface creation failed: {e}"))?;
-        SurfaceState::configure(self, surface, width, height)
+    /// The instance this context was created from.
+    #[must_use]
+    pub const fn instance(&self) -> &wgpu::Instance {
+        &self.instance
     }
 
     /// Description of the adapter, for the window title or a HUD line.
@@ -242,6 +280,25 @@ pub struct SurfaceState {
     pub is_srgb: bool,
 }
 
+/// Clamps a requested surface size to what the adapter can actually allocate.
+///
+/// Exceeding `max_texture_dimension_2d` is a validation error, not a fallback, so without this the app
+/// would panic on startup on any adapter whose limit is below the window size. That is not
+/// hypothetical: the software adapter used for development in this environment caps out at 2048, and a
+/// 1440p window is 2560 wide. Clamping produces a smaller-than-window swapchain that the compositor
+/// scales, which is a usable picture and a logged explanation, instead of a crash.
+fn clamp_to_adapter(ctx: &GpuContext, width: u32, height: u32) -> (u32, u32) {
+    let limit = ctx.adapter.limits().max_texture_dimension_2d;
+    let (cw, ch) = (width.min(limit).max(1), height.min(limit).max(1));
+    if (cw, ch) != (width, height) {
+        log::warn!(
+            "requested surface {width}x{height} exceeds the adapter's {limit} pixel limit; \
+             rendering at {cw}x{ch} and letting the compositor scale"
+        );
+    }
+    (cw, ch)
+}
+
 impl SurfaceState {
     fn configure(
         ctx: &GpuContext,
@@ -249,6 +306,7 @@ impl SurfaceState {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
+        let (width, height) = clamp_to_adapter(ctx, width, height);
         let caps = surface.get_capabilities(&ctx.adapter);
         if caps.formats.is_empty() {
             return Err("adapter offers no surface formats".to_string());
@@ -300,18 +358,30 @@ impl SurfaceState {
         })
     }
 
-    /// Reconfigures after a window resize. Zero-sized requests are ignored, since a surface cannot
-    /// be configured with a zero extent and the window will send a real size shortly after.
+    /// Reconfigures after a window resize.
+    ///
+    /// A zero-sized request is ignored: a surface cannot be configured with a zero extent, and the
+    /// window sends a real size moments later. The requested size is clamped to the adapter's limit
+    /// for the same reason as at startup.
+    ///
+    /// Failure is reported rather than fatal. A resize can race with the compositor, and an
+    /// occasional failed reconfigure is recoverable on the next frame; crashing on it would make the
+    /// app unusable while dragging a window edge.
     pub fn resize(&mut self, ctx: &GpuContext, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
+        let (width, height) = clamp_to_adapter(ctx, width, height);
         if self.config.width == width && self.config.height == height {
             return;
         }
         self.config.width = width;
         self.config.height = height;
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         self.surface.configure(&ctx.device, &self.config);
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            log::warn!("surface reconfigure to {width}x{height} failed: {error}");
+        }
     }
 
     /// Viewport size in physical pixels.

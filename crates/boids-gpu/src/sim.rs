@@ -122,10 +122,17 @@ impl SimResources {
             ],
             cell_start: make("cell_start", cell_bytes, storage | wgpu::BufferUsages::COPY_DST),
             cell_end: make("cell_end", cell_bytes, storage),
-            params: make("sim params", 256, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
+            // Sizes come from the structs, rounded up to the 16-byte multiple the uniform address
+            // space requires. Hardcoding them would go stale on the next field addition, and the
+            // symptom would be a bind group validation error rather than anything readable.
+            params: make(
+                "sim params",
+                (core::mem::size_of::<SimParams>() as u64).next_multiple_of(16),
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
             interaction: make(
                 "interaction",
-                256,
+                (core::mem::size_of::<InteractionUniforms>() as u64).next_multiple_of(16),
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             ),
             num_boids,

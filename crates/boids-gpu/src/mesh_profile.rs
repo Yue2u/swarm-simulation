@@ -5,6 +5,15 @@
 //! render pipeline can be shared without any branching on the mode.
 
 use boids_core::layout::{MeshParams, SceneUniform, SimMode};
+
+/// Fraction of the perception radius that a drawn agent occupies.
+///
+/// This is the single number that decides whether a swarm reads as a flock or as a cloud. Too small and
+/// each agent is a sub-pixel speck that aliases into noise; too large and the agents merge into one
+/// solid mass with no visible individual motion. Roughly a quarter of the perception radius leaves
+/// several body lengths of clear space between neighbours at typical flock density, which is what makes
+/// both the individuals and the formation legible at once.
+const AGENT_SIZE_FRACTION: f32 = 0.25;
 #[cfg(test)]
 use bytemuck::Zeroable;
 
@@ -18,7 +27,8 @@ use bytemuck::Zeroable;
 /// swept tail fin, a lateral travelling wave, and bioluminescent emission.
 /// Birds: a compact body, a wide swept wing, a flap animation, no emission.
 #[must_use]
-pub fn mesh_profile(mode: SimMode, speed_ref: f32) -> MeshParams {
+pub fn mesh_profile(mode: SimMode, speed_ref: f32, perception_radius: f32) -> MeshParams {
+    let scale = perception_radius * AGENT_SIZE_FRACTION;
     match mode {
         SimMode::Fish => MeshParams {
             // Tall and narrow: the cross-section reads as a fish rather than as a dart.
@@ -43,9 +53,9 @@ pub fn mesh_profile(mode: SimMode, speed_ref: f32) -> MeshParams {
             saturation: 0.85,
             value: 0.9,
             speed_ref,
+            scale,
             _pad_a: 0.0,
             _pad_b: 0.0,
-            _pad_c: 0.0,
         },
         SimMode::Birds => MeshParams {
             // Rounder and wider: a bird body seen from above is broader than it is deep.
@@ -68,9 +78,9 @@ pub fn mesh_profile(mode: SimMode, speed_ref: f32) -> MeshParams {
             saturation: 0.8,
             value: 1.0,
             speed_ref,
+            scale,
             _pad_a: 0.0,
             _pad_b: 0.0,
-            _pad_c: 0.0,
         },
     }
 }
@@ -88,6 +98,7 @@ pub fn scene_uniform(
     camera: boids_core::layout::CameraUniform,
     mode: SimMode,
     speed_ref: f32,
+    perception_radius: f32,
 ) -> SceneUniform {
     let (light_dir, ambient, fog_color, fog_density) = match mode {
         SimMode::Fish => (
@@ -107,7 +118,7 @@ pub fn scene_uniform(
     };
     SceneUniform {
         camera,
-        mesh: mesh_profile(mode, speed_ref),
+        mesh: mesh_profile(mode, speed_ref, perception_radius),
         light_dir,
         ambient,
         fog_color,
@@ -121,8 +132,8 @@ mod tests {
 
     #[test]
     fn fish_and_bird_profiles_differ_in_the_expected_ways() {
-        let fish = mesh_profile(SimMode::Fish, 14.0);
-        let bird = mesh_profile(SimMode::Birds, 32.0);
+        let fish = mesh_profile(SimMode::Fish, 14.0, 3.5);
+        let bird = mesh_profile(SimMode::Birds, 32.0, 14.0);
 
         // The fish cross-section is taller than it is wide; the bird's is the other way around.
         assert!(fish.body_h > fish.body_w, "fish should be laterally compressed");
@@ -141,8 +152,8 @@ mod tests {
     #[test]
     fn fish_medium_is_much_denser_than_air() {
         let cam = boids_core::layout::CameraUniform::zeroed();
-        let fish = scene_uniform(cam, SimMode::Fish, 14.0);
-        let bird = scene_uniform(cam, SimMode::Birds, 32.0);
+        let fish = scene_uniform(cam, SimMode::Fish, 14.0, 3.5);
+        let bird = scene_uniform(cam, SimMode::Birds, 32.0, 14.0);
         assert!(
             fish.fog_density > bird.fog_density * 10.0,
             "water should extinguish far faster than air"
@@ -153,7 +164,7 @@ mod tests {
 
     #[test]
     fn profile_carries_the_speed_reference() {
-        assert_eq!(mesh_profile(SimMode::Fish, 14.0).speed_ref, 14.0);
-        assert_eq!(mesh_profile(SimMode::Birds, 32.0).speed_ref, 32.0);
+        assert_eq!(mesh_profile(SimMode::Fish, 14.0, 3.5).speed_ref, 14.0);
+        assert_eq!(mesh_profile(SimMode::Birds, 32.0, 14.0).speed_ref, 32.0);
     }
 }

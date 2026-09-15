@@ -133,9 +133,14 @@ struct MeshParams {
     value: f32,
     // 64
     speed_ref: f32,
+    // Uniform scale applied to the whole mesh. Without it every agent would be drawn at the same
+    // absolute size (~1.5 world units), which is invisible dust in a world sized for 100k agents and
+    // an impenetrable wall in a small one. The host sets this to a fraction of the perception radius so
+    // that an agent always occupies a similar share of the space it can see, which is what keeps the
+    // swarm readable across both worlds and both scales.
+    scale: f32,
     pad_a: f32,
     pad_b: f32,
-    pad_c: f32,
     // 80 == size
 }
 
