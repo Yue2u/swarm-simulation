@@ -311,11 +311,16 @@ mod tests {
     use crate::config::SimConfig;
     use crate::layout::Boid;
 
-    /// Spawns `n` agents uniformly in a box, delegating to the shared spawn so that the reference
-    /// tests and the GPU tests start from identical state.
+    /// Spawns `n` agents inside a world of half-extent `half`, delegating to the shared spawn so that
+    /// the reference tests and the GPU tests start from identical state.
+    ///
+    /// The world is set to exactly `half` rather than to a multiple of it: the spawner keeps its
+    /// cluster inside `MAX_FILL_FRACTION` of the bounds on its own, so scaling the world here would
+    /// only make the swarm denser than the density it is sized for.
     fn spawn(n: usize, seed: u64, half: Vec3, speed: f32) -> Vec<Boid> {
         let mut cfg = SimConfig::for_mode(SimMode::Fish, n);
-        cfg.bounds_half = half / 0.6;
+        cfg.bounds_half = half;
+        cfg.spawn_center = Vec3::ZERO;
         cfg.min_speed = speed * 0.5;
         cfg.max_speed = speed;
         crate::spawn::spawn_swarm(&cfg, seed)

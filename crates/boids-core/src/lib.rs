@@ -33,4 +33,4 @@ pub use layout::{
 };
 pub use math::{clamp_len, order_parameter, smoothstep};
 pub use rng::Pcg32;
-pub use spawn::{spawn_shell, spawn_swarm, validation_issues};
+pub use spawn::{spawn_shell, spawn_swarm, swarm_extent, validation_issues};

@@ -94,6 +94,14 @@ pub struct SimConfig {
     pub grid: GridDims,
     /// Soft bounds half-extent for steering.
     pub bounds_half: Vec3,
+    /// Centre of the initial swarm cluster.
+    ///
+    /// Not the world centre in every mode. The underwater world has a reef canopy that reaches up
+    /// from the seafloor, and a cluster centred on the origin would put a percent of the swarm
+    /// *inside* rock, which the avoidance field then has to push out over the first seconds. Lifting
+    /// the cluster above the canopy means every fish starts in open water and the reef is something
+    /// the swarm swims down into. The sky world is empty for now, so its cluster sits at the origin.
+    pub spawn_center: Vec3,
 
     /// Separation weight.
     pub w_sep: f32,
@@ -175,11 +183,19 @@ impl SimConfig {
             SimMode::Fish => (EnvironmentKind::Reef, 42.0, -bounds_half.y),
             SimMode::Birds => (EnvironmentKind::Terrain, 120.0, 0.0),
         };
+        // Fish start above the reef canopy rather than at the world centre: a reef column reaches at
+        // most `env_floor_y + 46` metres, so a cluster based at 30% of the half-height stays clear of
+        // every column while still being inside the camera's framing of the origin.
+        let spawn_center = match mode {
+            SimMode::Fish => Vec3::new(0.0, bounds_half.y * 0.3, 0.0),
+            SimMode::Birds => Vec3::ZERO,
+        };
         Self {
             num_boids,
             mode,
             grid,
             bounds_half,
+            spawn_center,
             w_sep: 1.6,
             w_ali: 1.0,
             w_coh: 0.9,
@@ -225,6 +241,9 @@ impl SimConfig {
         cfg.r_percept = r_percept;
         cfg.r_sep = r_percept * 0.35;
         cfg.bounds_half = Vec3::splat(half);
+        // The test worlds are symmetric cubes with no environment, so the cluster belongs at the
+        // origin where the boundary ramp reaches it uniformly from every side.
+        cfg.spawn_center = Vec3::ZERO;
         cfg.max_speed = 6.0;
         cfg.min_speed = 2.0;
         cfg.max_force = 18.0;
