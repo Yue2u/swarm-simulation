@@ -75,6 +75,15 @@ pub fn column_radius_profile(t: f32, base_radius: f32, taper: f32) -> f32 {
     base_radius * (1.0 - taper * t * t) * (1.0 + 0.12 * (t * 9.0).sin())
 }
 
+/// Bias added to the reef's cell coordinate before the `floor`.
+///
+/// Must equal `REEF_CELL_BIAS` in `shaders/common/sdf.wgsl`. It exists because a GPU driver may
+/// rewrite `p / period` as `p * (1 / period)`, and the reciprocal is not exactly representable: a
+/// sample sitting exactly on a cell boundary then floors to different cells on the two sides and the
+/// fields disagree by metres. A sample grid that steps through ±96 with a 48 m period hits exactly
+/// that case, which is how this was found (`sdf_wgsl_matches_rust` was red on the Mesa GL adapter).
+pub const CELL_BIAS: f32 = 1e-4;
+
 /// The reef field: two domain-repeated families of tapered columns plus a seafloor.
 ///
 /// `period` is the repetition spacing in `xz`. Domain repetition is what keeps the field cheap:
@@ -87,7 +96,7 @@ pub fn column_radius_profile(t: f32, base_radius: f32, taper: f32) -> f32 {
 #[inline]
 #[must_use]
 pub fn reef_field(p: Vec3, period: f32, seafloor_y: f32) -> f32 {
-    let cell = (p.xz() / period).floor();
+    let cell = (p.xz() / period + Vec2::splat(CELL_BIAS)).floor();
     // Hash the cell to vary radius and height per column without a texture lookup.
     let h = hash2(cell);
     let center = (cell + Vec2::splat(0.5)) * period;

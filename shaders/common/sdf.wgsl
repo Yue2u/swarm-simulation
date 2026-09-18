@@ -82,12 +82,24 @@ fn hash21(p: vec2<f32>) -> f32 {
 // Environments
 // ---------------------------------------------------------------------------------------------
 
+// Bias added to the cell coordinate before the `floor`, so that a sample sitting exactly on a cell
+// boundary lands in the same cell on the CPU and the GPU.
+//
+// This is not paranoia, it is a real portability hazard that this repository already hit: a driver
+// is free to rewrite `p / period` as `p * (1 / period)`, and the reciprocal of 48 is not exactly
+// representable, so `96.0 / 48.0` evaluates to 1.9999999 on one side and 2.0 on the other. The two
+// sides then sample different columns and disagree by metres on a field that is supposed to agree
+// to 1e-4. `CELL_BIAS` in `crates/boids-core/src/sdf.rs` must hold the same value: it is a million
+// times larger than the rounding a reciprocal introduces and four orders of magnitude smaller than
+// anything the field's users can see (0.004 m on a 48 m period).
+const REEF_CELL_BIAS: f32 = 1e-4;
+
 // The reef: domain-repeated tapered columns rising from a seafloor.
 //
 // `period` is the repetition spacing in world metres and `floor_y` the seafloor height. Two
 // column families at different phases are blended so the reef does not read as a regular lattice.
 fn reef_field(p: vec3<f32>, period: f32, floor_y: f32) -> f32 {
-    let cell = floor(p.xz / period);
+    let cell = floor(p.xz / period + vec2<f32>(REEF_CELL_BIAS));
     let h = hash21(cell);
     let center = (cell + vec2<f32>(0.5)) * period;
     let height = 20.0 + 26.0 * h;
