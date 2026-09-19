@@ -64,15 +64,23 @@ fn accum_add(acc: ptr<function, NeighbourAccum>, pos: vec3<f32>, other: Boid, d2
 // compresses, while the steering form saturates at `max_speed`, so a dense flock is stable instead
 // of exploding.
 //
-// Density-adaptive weights:
-//   w_sep_eff = w_sep * (1 + density)          dense cells push apart harder
-//   w_coh_eff = w_coh * exp(-density)          dense cells stop pulling together
-// These two together are what prevent the classic boids failure where cohesion wins and the flock
-// collapses into a point.
+// Density-adaptive weights, a symmetric feedback around the reference density:
+//   push      = density^gain                       (= 1 at density == 1 for any gain)
+//   w_sep_eff = w_sep * push
+//   w_coh_eff = w_coh / push
+// `gain == 0` is fixed weights, `gain == 1` the proportional feedback `push == density`. Over-dense
+// regions push apart and under-dense ones pull together. The neutral point matters: a flock spawned
+// at the reference density must start at equilibrium, otherwise the initial separation impulse blows
+// the cluster apart before cohesion can ever act.
 fn neighbour_force(acc: NeighbourAccum, pos: vec3<f32>, vel: vec3<f32>) -> vec3<f32> {
     let density = acc.count * params.sep_boost;
-    let w_sep_eff = params.w_sep * (1.0 + density);
-    let w_coh_eff = params.w_coh * exp(-density);
+    let gain = max(params.coh_falloff, 0.0);
+    var push = 1.0;
+    if (acc.count > 0.0) {
+        push = pow(max(density, 1e-6), gain);
+    }
+    let w_sep_eff = params.w_sep * push;
+    let w_coh_eff = params.w_coh / push;
 
     var force = acc.separation * w_sep_eff;
 
@@ -98,12 +106,13 @@ fn neighbour_force(acc: NeighbourAccum, pos: vec3<f32>, vel: vec3<f32>) -> vec3<
 // force has no way to break the symmetry that keeps an agent pinned against a wall: the agent
 // pushes in, is pushed out along the same line, and oscillates. Redirecting along the tangential
 // component of velocity gives it a direction to escape in.
-fn environment_force(pos: vec3<f32>, vel: vec3<f32>, env_id: u32, env_scale: f32, env_floor_y: f32) -> vec3<f32> {
+fn environment_force(pos: vec3<f32>, vel: vec3<f32>, env_id: u32, env_scale: f32, env_freq: f32, env_floor_y: f32) -> vec3<f32> {
     if (env_id == ENV_NONE) {
         return vec3<f32>(0.0);
     }
-    let d = eval_field(pos, env_id, env_scale, env_floor_y);
-    let grad = sdf_gradient_at(pos, 0.5 * params.cell_size, env_id, env_scale, env_floor_y);
+    let field = FieldArgs(env_id, env_scale, env_freq, env_floor_y);
+    let d = eval_field(pos, field);
+    let grad = sdf_gradient_at(pos, 0.5 * params.cell_size, field);
     let normal = safe_normalize(grad);
 
     var force = avoid_force_from(d, normal, params.r_safe, params.sdf_strength);
@@ -111,7 +120,7 @@ fn environment_force(pos: vec3<f32>, vel: vec3<f32>, env_id: u32, env_scale: f32
     let speed = length(vel);
     if (speed > 1e-3) {
         let ahead = pos + vel * (params.sdf_probe / speed);
-        if (eval_field(ahead, env_id, env_scale, env_floor_y) < params.r_safe) {
+        if (eval_field(ahead, field) < params.r_safe) {
             let v_tangent = vel - normal * dot(vel, normal);
             let tangent_dir = safe_normalize(v_tangent);
             if (dot(tangent_dir, tangent_dir) > 0.5) {

@@ -3,6 +3,7 @@
 use glam::Vec3;
 
 use crate::layout::{EnvironmentKind, InteractionMode, InteractionUniforms, SimMode, SimParams};
+use crate::terrain;
 
 /// Grid resolution and derived linearisation constants.
 ///
@@ -102,6 +103,13 @@ pub struct SimConfig {
     /// the cluster above the canopy means every fish starts in open water and the reef is something
     /// the swarm swims down into. The sky world is empty for now, so its cluster sits at the origin.
     pub spawn_center: Vec3,
+    /// How random the spawn velocities are: 0 spawns every agent on one shared heading, 1 spawns
+    /// fully random directions. A dense cluster of randomly heading agents carries no net momentum
+    /// and flies apart ballistically before alignment and cohesion can organise it - the flock
+    /// shatters into micro-swarms on the first seconds. The demo therefore starts coherent with a
+    /// small jitter, which is also what a real flock does. The obstacle tests use `spawn_shell`,
+    /// which stays fully random because agents must approach from every side.
+    pub spawn_spread: f32,
 
     /// Separation weight.
     pub w_sep: f32,
@@ -113,8 +121,12 @@ pub struct SimConfig {
     pub r_percept: f32,
     /// Separation radius, meters.
     pub r_sep: f32,
-    /// Density at which adaptive weights start to kick in.
+    /// Reference local density, in neighbours inside `r_percept`, at which the adaptive weights are
+    /// neutral (both multipliers equal 1). Above it separation dominates, below it cohesion does.
     pub density_ref: f32,
+    /// Strength of the symmetric density feedback around `density_ref`. 0 disables it (fixed
+    /// weights); larger values make the weights swing harder per neighbour over the reference.
+    pub density_gain: f32,
 
     /// Speed clamp.
     pub min_speed: f32,
@@ -143,6 +155,12 @@ pub struct SimConfig {
     pub env: EnvironmentKind,
     /// Field scale: reef column repetition period, or terrain amplitude in metres.
     pub env_scale: f32,
+    /// Terrain base noise frequency, m^-1. Unused by the reef.
+    ///
+    /// Shared with the renderer, which bakes the heightfield with it: a mesh built from one
+    /// frequency and a collision field from another would put the drawn ground and the avoided
+    /// ground in different places, which is the most expensive divergence this project can ship.
+    pub env_freq: f32,
     /// Seafloor height for the reef field. Ignored by the terrain field.
     pub env_floor_y: f32,
 }
@@ -179,16 +197,40 @@ impl SimConfig {
         // The reef's repetition period is chosen so a column spans several perception radii: agents
         // then have to genuinely steer around an obstacle rather than drift past a bump. Terrain uses
         // the amplitude of the height field instead, and ignores the seafloor height.
-        let (env, env_scale, env_floor_y) = match mode {
-            SimMode::Fish => (EnvironmentKind::Reef, 42.0, -bounds_half.y),
-            SimMode::Birds => (EnvironmentKind::Terrain, 120.0, 0.0),
+        //
+        // The terrain's two numbers are derived from the *world* rather than fixed, because the same
+        // expression has to look like mountains across the 1.2 km world and like hills across the
+        // 250 m test worlds the render suite builds. Fixing them would make one of the two a
+        // featureless slope. `env_freq` is what the heightfield the renderer bakes is sampled with,
+        // so the two must be the same value, and they are: both come from here.
+        let (env, env_scale, env_freq, env_floor_y) = match mode {
+            SimMode::Fish => (
+                EnvironmentKind::Reef,
+                42.0,
+                terrain::frequency_for_extent(bounds_half.x),
+                -bounds_half.y,
+            ),
+            SimMode::Birds => (
+                EnvironmentKind::Terrain,
+                terrain::amplitude_for_extent(bounds_half.y),
+                terrain::frequency_for_extent(bounds_half.x),
+                0.0,
+            ),
         };
         // Fish start above the reef canopy rather than at the world centre: a reef column reaches at
         // most `env_floor_y + 46` metres, so a cluster based at 30% of the half-height stays clear of
         // every column while still being inside the camera's framing of the origin.
+        //
+        // Birds start in the upper part of the box and *overlap* the terrain. Keeping the whole
+        // cluster above the ridge was tried and rejected: a 100k bird flock at the reference density
+        // is taller than the air above the ridge, so the only way to fit was to compress the cluster,
+        // which multiplies its density and - through the adaptive weights - pushes it apart into
+        // micro-flocks. A slightly lower centre keeps the density at the reference value, and the
+        // avoidance field lifts the minority of birds that start inside a slope within the first
+        // seconds.
         let spawn_center = match mode {
             SimMode::Fish => Vec3::new(0.0, bounds_half.y * 0.3, 0.0),
-            SimMode::Birds => Vec3::ZERO,
+            SimMode::Birds => Vec3::new(0.0, bounds_half.y * 0.15, 0.0),
         };
         Self {
             num_boids,
@@ -196,12 +238,19 @@ impl SimConfig {
             grid,
             bounds_half,
             spawn_center,
+            spawn_spread: 0.2,
             w_sep: 1.6,
             w_ali: 1.0,
             w_coh: 0.9,
             r_percept,
             r_sep: r_percept * 0.35,
-            density_ref: 12.0,
+            // The reference density sets the average perception degree, and a 3D flock only stays
+            // connected while that degree carries a margin over the random-geometric-graph
+            // threshold `ln(n)`. At 100k `ln(n)` is ~11.5, so the old fixed 12 spawned right at the
+            // threshold and the flock disintegrated into micro-swarms. 30 is ~2.6x the threshold
+            // there while staying affordable for the grid search.
+            density_ref: 30.0,
+            density_gain: 1.0,
             min_speed: max_speed * 0.35,
             max_speed,
             max_force: max_speed * 3.0,
@@ -214,6 +263,7 @@ impl SimConfig {
             drag,
             env,
             env_scale,
+            env_freq,
             env_floor_y,
         }
     }
@@ -240,15 +290,53 @@ impl SimConfig {
         let mut cfg = Self::for_mode(SimMode::Birds, n);
         cfg.r_percept = r_percept;
         cfg.r_sep = r_percept * 0.35;
-        cfg.bounds_half = Vec3::splat(half);
+        // The world was sized for exactly `neighbours` inside `r_percept`, so that is the density
+        // the adaptive weights must be neutral at.
+        cfg.density_ref = neighbours.max(1.0);
+        cfg.resize_world(Vec3::splat(half));
         // The test worlds are symmetric cubes with no environment, so the cluster belongs at the
         // origin where the boundary ramp reaches it uniformly from every side.
         cfg.spawn_center = Vec3::ZERO;
         cfg.max_speed = 6.0;
         cfg.min_speed = 2.0;
         cfg.max_force = 18.0;
+        // The test worlds are cubes the ramp reaches from every side, and they deliberately have no
+        // environment to avoid: the physics tests compare against a CPU reference that has no field.
+        cfg.env = crate::layout::EnvironmentKind::None;
         cfg.grid = GridDims::for_domain(cfg.bounds_half, r_percept, 64);
         cfg
+    }
+
+    /// Re-sizes the world to `half` per axis, recomputing everything derived from it.
+    ///
+    /// The screenshot mode and the render tests shrink the world so that a few thousand agents are
+    /// visible rather than a speck, and every one of `bounds_half`'s dependants has to follow: the
+    /// grid's extent and cell size, the environment's amplitude and frequency (both *world-relative*,
+    /// see `terrain::frequency_for_extent`), the seafloor, and the spawn centre, which is placed
+    /// relative to the field it must stay clear of. Assigning `bounds_half` directly - which is what
+    /// this method replaces - leaves a test world with the app world's 110 m mountains and a spawn
+    /// point above them, outside the box it is supposed to be inside.
+    pub fn resize_world(&mut self, half: Vec3) {
+        self.bounds_half = half;
+        self.grid = GridDims::for_domain(half, self.r_percept, 256);
+        match self.mode {
+            SimMode::Fish => {
+                // The reef's repetition period is a property of the reef, not of the world, so it
+                // stays; only the seafloor has to follow the box it sits in.
+                self.env_floor_y = -half.y;
+            }
+            SimMode::Birds => {
+                self.env_scale = terrain::amplitude_for_extent(half.y);
+                self.env_freq = terrain::frequency_for_extent(half.x);
+                self.env_floor_y = 0.0;
+            }
+        }
+        self.spawn_center = match self.mode {
+            SimMode::Fish => Vec3::new(0.0, half.y * 0.3, 0.0),
+            // See `for_mode` for why the sky cluster sits at 15% of the half-height and overlaps the
+            // ground rather than being lifted clear of it.
+            SimMode::Birds => Vec3::new(0.0, half.y * 0.15, 0.0),
+        };
     }
 
     /// Perception radius used by the shaders.
@@ -282,14 +370,14 @@ impl SimConfig {
             mode: self.mode.as_u32(),
             wander: self.wander,
             sep_boost: 1.0 / self.density_ref.max(1e-3),
-            coh_falloff: 1.0 / self.density_ref.max(1e-3),
+            coh_falloff: self.density_gain.max(0.0),
             r_safe: self.r_safe,
             buoyancy: self.buoyancy,
             drag: self.drag,
             env_scale: self.env_scale,
+            env_freq: self.env_freq,
             env_floor_y: self.env_floor_y,
             env_id: self.env.as_u32(),
-            _pad0: 0.0,
             _pad1: 0.0,
             _pad2: 0.0,
         }

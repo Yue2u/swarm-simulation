@@ -85,6 +85,7 @@ What the suites actually assert:
 | `grid/long_run_matches_naive` | a grid that is right at spawn but loses neighbours as the swarm moves |
 | `sdf/wgsl_matches_rust` | a CPU/GPU divergence in the reef or terrain field, or a sign flip |
 | `render/background_has_structure` | a missing backdrop pass, or a flipped Y in the ray reconstruction |
+| `render/terrain_grounds_the_sky_world` | a terrain mesh with holes (the wrong triangle winding is culled) or no ground pass |
 | `render/agents_contribute_pixels` | a mesh function or instanced draw producing nothing |
 | `render/depth_is_written` | geometry rejected by the depth test (skipped where the backend cannot copy depth) |
 | `render/worlds_look_different` | a stale scene uniform, so the mode never reaches the shaders |
@@ -99,7 +100,7 @@ simulation just behaves subtly wrong because `r_percept` on the host is `w_coh` 
 
 ## Status
 
-Days 1-3 complete:
+Days 1-4 complete, except the world morph:
 
 * fully GPU-resident simulation: ping-pong agent buffers, no CPU loop over agents,
 * the agent mesh and its orientation basis are generated in the vertex shader from `vertex_index` and
@@ -115,9 +116,10 @@ Days 1-3 complete:
   `--strategy naive|grid` to force either for an A/B comparison,
 * **`--bench`**: headless per-pass GPU timings via timestamp queries, which is where the numbers in
   [docs/perf.md](docs/perf.md) come from,
-* **the underwater world**: a depth-writing sphere trace of the simulation's own reef field, shaded
+* **the underwater world**: a half-resolution sphere trace of the simulation's own reef field, shaded
   with per-channel Beer-Lambert extinction and in-scatter, procedural caustics, god rays and
-  bioluminescent agents ([ADR-0005](docs/adr/0005-raymarched-environment-with-depth.md)),
+  bioluminescent agents, resolved to full size with depth
+  ([ADR-0005](docs/adr/0005-raymarched-environment-with-depth.md)),
 * **HDR + bloom + ACES**: every geometry pass writes `Rgba16Float`, a three-level bloom pyramid spreads
   light from the fish and the caustics, and the composite tone maps with ACES
   ([ADR-0004](docs/adr/0004-hdr-intermediate-and-post-chain.md)),
@@ -126,13 +128,35 @@ Days 1-3 complete:
 * **the SDF contract on the device**: `sdf/wgsl_matches_rust` compares the CPU twin of the reef and
   terrain fields against the shader on a 32^3 grid.
 
-Not yet (day 4):
+Day 4 adds:
 
-* the terrain world: a compute heightfield and biome mask, a vertex-pulling clipmap mesh, tree scatter,
-  and atmospheric scattering. The birds world still uses the day-1 gradient backdrop.
-* morphing the two worlds together on `tab`: the switch is instant today, without the 1.5 s transition,
-* the two-world collision story is only complete underwater; the birds' terrain avoidance is wired to
-  the field but the field has no mesh drawn yet.
+* **the terrain world**: a compute heightfield baked once into an `Rgba32Float` map, three biomes
+  (forest, dunes, canyon) as a continuous mask, a vertex-pulling grid mesh and a blue-noise tree
+  scatter that respects the biome,
+* **an analytic atmosphere**: single Rayleigh + Mie scattering for the sky, `aerial_perspective` that
+  fades distant terrain into it, and a matching sun disc,
+* **the underwater raymarch at half resolution**, with a full-size resolve that writes depth, so the
+  heaviest pass costs a quarter of its pixels,
+* **a fix for the TAB switch**: the ground is built for the sky world even when the app starts
+  underwater, so switching worlds shows a terrain the size of the world the birds fly in,
+* **a one-flock spawn and a stable force balance**: the swarm spawns on a shared heading (with a
+  small `spawn_spread` jitter) instead of random directions, and the adaptive weights are neutral at
+  `density_ref` (`push = density^density_gain`, `w_sep *= push`, `w_coh /= push`) instead of the old
+  `1 + density` / `exp(-density)` pair that was ~10x separation-dominant there. `density_ref` is 30
+  rather than 12 so the perception graph clears the random-geometric-graph connectivity threshold
+  (`ln n ~ 11.5` at 100k); at 100k the GPU keeps the whole bird flock in one component,
+* **a 1.5 s world morph on `tab`**: the bodies, animation, emission and palette cross-fade through
+  `boids_gpu::mesh_profile::scene_uniform_morph`, with the destination world's medium, without
+  recreating the device or the surface,
+* the terrain mesh winding, its slope shading and the spawn cluster were all fixed so the ground
+  is solid, coloured, and under a single dense flock.
+
+Not yet:
+
+* the *environment* does not morph, only the agents: an ocean and a sky are different geometry at
+  different scales, so the backdrop switches on the key press while the bodies cross-fade,
+* a dedicated check that a bird cannot pass through the drawn terrain; the field and the mesh now come
+  from one expression, which is the property that makes it true.
 
 ## Documentation
 
@@ -151,7 +175,7 @@ Not yet (day 4):
 crates/
   boids-core/    data contract, CPU reference, camera and ray math, SDF and terrain fields, WGSL loader
   boids-gpu/     device setup, buffers, compute pipelines, the device test suite
-  boids-scene/   water and post parameters, procedural art content (terrain: day 4)
+  boids-scene/   water and post parameters, the atmosphere, and procedural art content (terrain, trees)
   boids-render/  frame graph, passes, PNG output
   boids-app/     window, input, frame loop, CLI, screenshot mode
 shaders/         all WGSL, composed with a //#include preprocessor

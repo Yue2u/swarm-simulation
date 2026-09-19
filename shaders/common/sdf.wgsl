@@ -123,39 +123,57 @@ fn reef_field(p: vec3<f32>, period: f32, floor_y: f32) -> f32 {
     return smin(columns, sd_plane_y(p, floor_y), 6.0);
 }
 
+// Frequency of the domain warp relative to the terrain's own, and how far it displaces the field, in
+// lattice cells of the base octave. Must match `WARP_FREQUENCY`/`WARP_AMOUNT` in
+// `crates/boids-core/src/terrain.rs`.
+//
+// The warp is what turns a sum of smooth bumps into ridges and valleys, and it has to be *smooth* to
+// do that: hashing the cell containing the sample makes the warp jump six lattice cells every 1.4
+// metres, which is white noise with the terrain's amplitude rather than a landscape. That mistake was
+// made once, survived a boundedness test, and was unmistakable the first time the field was shaded.
+const WARP_FREQUENCY: f32 = 0.5;
+const WARP_AMOUNT: f32 = 2.0;
+
 // Procedural terrain height, matching `boids_core::terrain::height_at`.
 //
-// Sum of three octaves with domain warping: the warp is what turns a bland sum of sines into
-// ridges and valleys. The biome mask is a separate low-frequency field so that the terrain and
-// the biome boundaries are correlated but not identical, which avoids suspiciously rectangular
-// forests.
+// Four octaves of value noise with domain warping. The biome mask is a separate low-frequency field
+// so that the terrain and the biome boundaries are correlated but not identical, which avoids
+// suspiciously rectangular forests.
 fn terrain_height(p: vec2<f32>, amplitude: f32, frequency: f32) -> f32 {
+    let warp_scale = frequency * WARP_FREQUENCY;
     let warp = vec2<f32>(
-        hash21(p * 0.7 + vec2<f32>(11.3, 4.7)),
-        hash21(p * 0.7 + vec2<f32>(3.1, 19.9)),
+        value_noise(p * warp_scale + vec2<f32>(11.3, 4.7)),
+        value_noise(p * warp_scale + vec2<f32>(3.1, 19.9)),
     ) * 2.0 - vec2<f32>(1.0);
-    let q = p * frequency + warp * 6.0;
+    let q = p * frequency + warp * WARP_AMOUNT;
 
     var h = 0.0;
     var amp = 1.0;
     var freq = 1.0;
     var norm = 0.0;
     for (var octave = 0u; octave < 4u; octave = octave + 1u) {
-        // Value noise from the integer hash: no texture, no precomputed permutation table.
-        let cell = floor(q * freq);
-        let f = fract(q * freq);
-        let w = f * f * (3.0 - 2.0 * f);
-        let c00 = hash21(cell);
-        let c10 = hash21(cell + vec2<f32>(1.0, 0.0));
-        let c01 = hash21(cell + vec2<f32>(0.0, 1.0));
-        let c11 = hash21(cell + vec2<f32>(1.0, 1.0));
-        let n = mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
-        h = h + n * amp;
+        h = h + value_noise(q * freq) * amp;
         norm = norm + amp;
         amp = amp * 0.5;
         freq = freq * 2.03;
     }
     return (h / max(norm, 1e-6)) * amplitude;
+}
+
+// Value noise on the integer lattice with Hermite interpolation, matching
+// `boids_core::terrain::value_noise`.
+//
+// From the integer hash rather than a texture: no bindings, no precomputed permutation table, and
+// the same lattice on the CPU and the GPU.
+fn value_noise(p: vec2<f32>) -> f32 {
+    let cell = floor(p);
+    let f = fract(p);
+    let w = f * f * (3.0 - 2.0 * f);
+    let c00 = hash21(cell);
+    let c10 = hash21(cell + vec2<f32>(1.0, 0.0));
+    let c01 = hash21(cell + vec2<f32>(0.0, 1.0));
+    let c11 = hash21(cell + vec2<f32>(1.0, 1.0));
+    return mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
 }
 
 // Biome weights as (forest, dunes, canyon), summing to 1.
@@ -170,39 +188,72 @@ fn biome_weights(p: vec2<f32>, frequency: f32) -> vec3<f32> {
     return vec3<f32>(a, b, c) / total;
 }
 
+// Biome coordinate in [0, 2): 0 = forest, 1 = dunes, 2 = canyon, continuous across a transition.
+//
+// Derived from `biome_weights` rather than hashed on its own so that the palette ramp and the
+// weights cannot disagree. Because the weights sum to 1, the map is a sweep: at a forest/dunes
+// boundary `w.z` is 0 and the mask runs 0 -> 1, and at a dunes/canyon boundary `w.y` is 0 and it
+// runs 1 -> 2. One scalar is all the heightfield's second channel has room for, and one scalar is
+// all a three-stop palette ramp needs.
+fn biome_mask(p: vec2<f32>, frequency: f32) -> f32 {
+    let w = biome_weights(p, frequency);
+    return w.y + 2.0 * w.z;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Gradient-based avoidance
 // ---------------------------------------------------------------------------------------------
+
+// Everything the field functions need: which field, and its scale parameters.
+//
+// Bundled rather than passed as four positional scalars because three of them are `f32` and used
+// adjacently: `eval_field(p, ENV_TERRAIN, amplitude, frequency)` and
+// `eval_field(p, ENV_TERRAIN, frequency, amplitude)` both compile, and only one of them is the
+// terrain. `scale` means the reef's repetition period or the terrain's amplitude, depending on the
+// field, and `freq` is the terrain's base noise frequency (unused by the reef).
+struct FieldArgs {
+    id: u32,
+    scale: f32,
+    freq: f32,
+    floor_y: f32,
+}
+
+// The field the simulation should avoid, from its own parameters.
+fn sim_field_args(params: SimParams) -> FieldArgs {
+    return FieldArgs(params.env_id, params.env_scale, params.env_freq, params.env_floor_y);
+}
 
 // Central-difference gradient of an arbitrary scalar field.
 //
 // `eps` should be about half a cell: much smaller and the field's own noise dominates the
 // difference, much larger and thin obstacles are smoothed out of existence.
-fn sdf_gradient_at(p: vec3<f32>, eps: f32, field_id: u32, field_scale: f32, field_floor_y: f32) -> vec3<f32> {
+fn sdf_gradient_at(p: vec3<f32>, eps: f32, f: FieldArgs) -> vec3<f32> {
     let ex = vec3<f32>(eps, 0.0, 0.0);
     let ey = vec3<f32>(0.0, eps, 0.0);
     let ez = vec3<f32>(0.0, 0.0, eps);
-    let dx = eval_field(p + ex, field_id, field_scale, field_floor_y)
-        - eval_field(p - ex, field_id, field_scale, field_floor_y);
-    let dy = eval_field(p + ey, field_id, field_scale, field_floor_y)
-        - eval_field(p - ey, field_id, field_scale, field_floor_y);
-    let dz = eval_field(p + ez, field_id, field_scale, field_floor_y)
-        - eval_field(p - ez, field_id, field_scale, field_floor_y);
+    let dx = eval_field(p + ex, f) - eval_field(p - ex, f);
+    let dy = eval_field(p + ey, f) - eval_field(p - ey, f);
+    let dz = eval_field(p + ez, f) - eval_field(p - ez, f);
     return vec3<f32>(dx, dy, dz) / (2.0 * eps);
 }
 
-// Evaluates whichever environment field is active. `field_id` mirrors `EnvironmentKind` on the
+// Evaluates whichever environment field is active. `f.id` mirrors `EnvironmentKind` on the
 // host: 0 = empty space (no avoidance at all), 1 = reef, 2 = terrain.
-fn eval_field(p: vec3<f32>, field_id: u32, scale: f32, floor_y: f32) -> f32 {
-    if (field_id == 0u) {
+//
+// The terrain branch is the *same* expression the heightfield map is baked with
+// (`terrain/heightfield.wgsl`), evaluated with the same `scale` and `freq` that the host puts in
+// `SimParams`, so the surface the agents avoid and the surface the camera draws are one field
+// evaluated twice rather than two fields that happen to look alike.
+fn eval_field(p: vec3<f32>, f: FieldArgs) -> f32 {
+    if (f.id == ENV_NONE) {
         // A large positive constant means "infinitely far from any surface", so the avoidance
         // term vanishes without a branch in the caller.
         return 1e6;
     }
-    if (field_id == 1u) {
-        return reef_field(p, scale, floor_y);
+    if (f.id == ENV_REEF) {
+        return reef_field(p, f.scale, f.floor_y);
     }
-    return p.y - terrain_height(p.xz, scale, 0.0025);
+    return p.y - terrain_height(p.xz, f.scale, f.freq);
 }
 
 // Avoidance force from a distance value and a surface normal.

@@ -34,6 +34,10 @@ use crate::common::{rel_err, run_gpu_steps, setup, Check};
 fn comparison_config(n: usize, r_percept: f32, neighbours: f32) -> SimConfig {
     let mut cfg = SimConfig::dense(n, r_percept, neighbours);
     cfg.env = EnvironmentKind::None;
+    // The app spawns a coherent flock, but these checks need the initial state to be *disordered*:
+    // the aggregate check asserts the run reorganises, and comparing two identical "already
+    // organised" runs would exercise nothing. `dense` inherits the coherent spawn, so undo it here.
+    cfg.spawn_spread = 1.0;
     cfg
 }
 

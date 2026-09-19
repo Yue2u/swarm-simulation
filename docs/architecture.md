@@ -52,21 +52,25 @@ A frame moves data in one direction. The CPU writes four small uniform structs a
                                       |
                      swap ping-pong parity
                                       |
-  6. environment        sky: full-screen gradient, no depth write
-                        sea: full-screen SDF raymarch, writes depth
-  7. agent pass         one instanced draw, depth test LessEqual, depth write
-                                      |
-  8. bloom              bright, two downsamples, two additive upsamples
-  9. composite          aberration, exposure, ACES, grade -> swapchain
-                                      |
- 10. present
+  6. ocean raymarch     Fish: half-res SDF sphere trace -> ocean target (alpha = hit metres)
+  7. environment        sky: full-screen atmosphere, no depth write
+                        sea: full-res resolve into the scene target, writes depth
+  8. ground + trees     sky world only: vertex-pulled terrain, instanced trees, depth write
+  9. agent pass         one instanced draw, depth test LessEqual, depth write
+                                       |
+ 10. bloom              bright, two downsamples, two additive upsamples
+ 11. composite          aberration, exposure, ACES, grade -> swapchain
+                                       |
+ 12. present
 ```
 
-Passes 6 and 7 share one render pass and one depth attachment, which is what puts a fish behind a
-column: the raymarch writes the real hit distance and the agent pass tests against it. Passes 8 and 9
-run on the `Rgba16Float` intermediate and a three-level bloom pyramid, with no depth; the composite
-owns the transfer function. The render graph and why the intermediate is HDR rather than 8-bit are
-`ADR-0004`; why the underwater environment is a depth-writing raymarch is `ADR-0005`.
+Passes 7, 8 and 9 share one render pass and one depth attachment, which is what puts a fish behind a
+column and a bird behind a ridge: the resolve and the terrain write real distances and the agent pass
+tests against them. The underwater raymarch itself runs one pass earlier, at half resolution, and hands
+its colour and hit distance to the resolve through one `Rgba16Float` target. Passes 10 and 11 run on the
+`Rgba16Float` intermediate and a three-level bloom pyramid, with no depth; the composite owns the
+transfer function. The render graph and why the intermediate is HDR rather than 8-bit are `ADR-0004`;
+why the underwater environment is a raymarch that ends in a depth-writing resolve is `ADR-0005`.
 
 Passes 1-4 build the spatial grid and are what `Strategy::Grid` records; `Strategy::Naive` skips them
 and runs an all-pairs search in pass 5 instead, which is exact and faster below the crossover in

@@ -259,8 +259,15 @@ fn step_one<F: Fn(Vec3) -> f32>(
     }
 
     let density = count * density_ref_inv;
-    let w_sep = params.w_sep * (1.0 + density);
-    let w_coh = params.w_coh * (-density).exp();
+    // Symmetric density feedback, neutral at `density_ref` (both multipliers 1). The exponent form
+    // makes `gain == 0` mean fixed weights, `gain == 1` the proportional feedback `push == density`
+    // and larger gains swing harder. The former `1 + d` / `exp(-d)` pair was already ~10x
+    // separation-dominant at the reference density, so a cluster spawned there was pre-loaded to
+    // explode and broke into micro-flocks.
+    let gain = params.coh_falloff.max(0.0);
+    let push = if count > 0.0 { density.max(1e-6).powf(gain) } else { 1.0 };
+    let w_sep = params.w_sep * push;
+    let w_coh = params.w_coh / push;
 
     let mut acc = sep * w_sep;
 
@@ -368,6 +375,14 @@ mod tests {
         cfg.buoyancy = 0.0;
         let inter = SimConfig::idle_interaction();
         let mut boids = spawn(500, 11, cfg.bounds_half, cfg.max_speed);
+        // The spawner launches a coherent flock; spontaneous alignment has to start from disorder,
+        // so scatter the initial headings again.
+        let mut rng = crate::rng::Pcg32::new(11, 5);
+        for b in boids.iter_mut() {
+            let dir = rng.unit_vector();
+            b.vel = (dir * cfg.max_speed).to_array();
+            b.prev_dir = dir.to_array();
+        }
         let initial = crate::math::order_parameter(
             &boids.iter().map(|b| Vec3::from(b.vel)).collect::<Vec<_>>(),
         );
@@ -386,7 +401,10 @@ mod tests {
 
     #[test]
     fn separation_prevents_collapse() {
-        // With cohesion on and separation working, agents must not pile into a single point.
+        // With cohesion on and separation working, agents must not pile into a single point. The
+        // threshold is the separation radius rather than a fraction of the perception radius: at the
+        // reference density the flock is compact (its natural spacing is below `r_sep`), so a
+        // healthy flock sits just above it while a collapsed one falls through.
         let mut cfg = SimConfig::for_mode(SimMode::Birds, 150);
         cfg.wander = 0.0;
         cfg.buoyancy = 0.0;
@@ -400,8 +418,9 @@ mod tests {
         let c = crate::math::centroid(&points);
         let mean_dist = points.iter().map(|p| (*p - c).length()).sum::<f32>() / points.len() as f32;
         assert!(
-            mean_dist > cfg.r_percept * 0.5,
-            "swarm collapsed: mean distance from centroid {mean_dist}"
+            mean_dist > cfg.r_sep,
+            "swarm collapsed: mean distance from centroid {mean_dist} is inside r_sep={}",
+            cfg.r_sep
         );
     }
 
@@ -496,6 +515,133 @@ mod tests {
         }
         let after = crate::math::mean_distance_to(&boids, focus);
         assert!(after > before, "repeller did not push: {before} -> {after}");
+    }
+
+    /// Connected components at `r_percept`, and the fraction in the largest, via union-find.
+    fn connectivity(boids: &[Boid], radius: f32) -> (usize, f32) {
+        let n = boids.len();
+        let r2 = radius * radius;
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn root(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        for (i, b) in boids.iter().enumerate() {
+            let pi = Vec3::from(b.pos);
+            for (j, other) in boids.iter().enumerate().skip(i + 1) {
+                if (Vec3::from(other.pos) - pi).length_squared() <= r2 {
+                    let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                    if a != b {
+                        parent[a] = b;
+                    }
+                }
+            }
+        }
+        let mut sizes: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for i in 0..n {
+            *sizes.entry(root(&mut parent, i)).or_default() += 1;
+        }
+        let largest = sizes.values().copied().max().unwrap_or(0);
+        (sizes.len(), largest as f32 / n.max(1) as f32)
+    }
+
+    /// Advances the app world from a normal coherent spawn, with the real environment field, and
+    /// returns the settled flock.
+    fn settle(cfg: &SimConfig, seed: u64, steps: usize, env: bool) -> Vec<Boid> {
+        let inter = SimConfig::idle_interaction();
+        let mut boids = crate::spawn::spawn_swarm(cfg, seed);
+        let eps = 0.5 * cfg.grid.cell_size;
+        for step in 0..steps {
+            let params = cfg.to_params(step as f32 * cfg.dt, cfg.dt);
+            match (cfg.mode, env) {
+                (SimMode::Fish, true) => {
+                    let field = |p: Vec3| crate::sdf::reef_field(p, cfg.env_scale, cfg.env_floor_y);
+                    step_cpu(&mut boids, &params, &inter, Some(&field), eps);
+                }
+                (SimMode::Birds, true) => {
+                    let field = |p: Vec3| {
+                        p.y - crate::terrain::height_at(
+                            glam::Vec2::new(p.x, p.z),
+                            cfg.env_scale,
+                            cfg.env_freq,
+                        )
+                    };
+                    step_cpu(&mut boids, &params, &inter, Some(&field), eps);
+                }
+                _ => step_cpu(&mut boids, &params, &inter, None::<&fn(Vec3) -> f32>, eps),
+            }
+        }
+        boids
+    }
+
+    /// The flock must survive contact with the world as one body.
+    ///
+    /// Regression for the report that the swarm "starts as one cloud then splits into 5-10 boid
+    /// swarms". Two causes compounded: the spawn gave every agent a random heading (so the dense
+    /// cluster flew apart ballistically) and the adaptive weights were already ~10x
+    /// separation-dominant at `density_ref` (so the cluster was pre-loaded to explode). With both
+    /// fixed this measures one group; before, it measured ~50 groups with the largest holding 14%.
+    #[test]
+    fn spawned_flock_stays_one_group() {
+        for mode in [SimMode::Fish, SimMode::Birds] {
+            for seed in [4u64, 11] {
+                let cfg = SimConfig::for_mode(mode, 800);
+                let boids = settle(&cfg, seed, 600, true);
+                let (groups, largest) = connectivity(&boids, cfg.r_percept);
+                assert!(
+                    largest >= 0.8,
+                    "{mode:?} seed {seed}: flock shattered into {groups} groups, largest {:.0}%",
+                    largest * 100.0
+                );
+            }
+        }
+    }
+
+    /// Mean nearest-neighbour distance and the closest pair, the collision/spacing signal.
+    fn nn_stats(boids: &[Boid]) -> (f32, f32) {
+        let n = boids.len();
+        let mut sum = 0.0f32;
+        let mut closest = f32::INFINITY;
+        for (i, b) in boids.iter().enumerate() {
+            let pi = Vec3::from(b.pos);
+            let mut best = f32::INFINITY;
+            for (j, other) in boids.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let d = (Vec3::from(other.pos) - pi).length();
+                best = best.min(d);
+                closest = closest.min(d);
+            }
+            sum += best;
+        }
+        (sum / n as f32, closest)
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic, run with --ignored --nocapture"]
+    fn tune_swarm() {
+        for mode in [SimMode::Fish, SimMode::Birds] {
+            for density_ref in [18.0f32, 24.0, 30.0, 36.0] {
+                for env in [false, true] {
+                    let mut cfg = SimConfig::for_mode(mode, 1000);
+                    cfg.density_ref = density_ref;
+                    cfg.density_gain = 1.0;
+                    let boids = settle(&cfg, 5, 600, env);
+                    let (groups, largest) = connectivity(&boids, cfg.r_percept);
+                    let (mean_nn, closest) = nn_stats(&boids);
+                    println!(
+                        "{mode:?} dref {density_ref:>4} env {env:>5}: groups {groups:>3}, largest \
+                         {:>3.0}%, nn {mean_nn:5.2} (r_sep {:.2}), closest {closest:.2}",
+                        largest * 100.0,
+                        cfg.r_sep,
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -21,7 +21,7 @@ use boids_gpu::profile::{GpuProfiler, MAX_TIMED_PASSES};
 use boids_gpu::sim::{SimPipelines, SimResources, Strategy};
 use boids_render::renderer::{FrameInput, Renderer};
 use boids_render::SceneBinding;
-use glam::{Vec2, Vec3};
+use glam::Vec2;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -87,6 +87,40 @@ const PROFILE_INTERVAL_FRAMES: u64 = 60;
 /// that it is not inside the near plane.
 const INTERACTION_PLANE_FRACTION: f32 = 0.6;
 
+/// How long the agents take to cross-fade from one world's shape to the other's, in seconds.
+///
+/// The *environment* switches on the key press: the two backdrops are different geometry at different
+/// scales and there is no blend between an ocean and a sky. The agents do morph, because a fish and a
+/// bird are the same pipeline with a different set of numbers, and `render/boid.wgsl` blends those
+/// numbers rather than branching on them.
+const MORPH_SECONDS: f32 = 1.5;
+
+/// A world switch in progress.
+#[derive(Debug, Clone, Copy)]
+struct WorldMorph {
+    /// World being left, for the agent shape.
+    from: SimMode,
+    /// World being entered.
+    to: SimMode,
+    /// Simulation parameters of each, so the blend of `speed_ref` and mesh scale is tied to the
+    /// physics each shape belongs to.
+    from_speed: f32,
+    to_speed: f32,
+    from_percept: f32,
+    to_percept: f32,
+    /// Blend factor in [0, 1], advanced by the frame time.
+    t: f32,
+}
+
+impl WorldMorph {
+    /// Blend factor clamped for the shader.
+    fn eased(&self) -> f32 {
+        let t = self.t.clamp(0.0, 1.0);
+        // Smoothstep, so the morph leaves and arrives at rest instead of starting with a velocity jump.
+        t * t * (3.0 - 2.0 * t)
+    }
+}
+
 /// The application.
 pub struct BoidsApp {
     startup: StartupConfig,
@@ -107,6 +141,8 @@ pub struct BoidsApp {
     last_frame: Option<std::time::Instant>,
     /// Frames rendered since startup, for the HUD.
     frames: u64,
+    /// An in-progress world switch, or `None` when settled in one world.
+    morph: Option<WorldMorph>,
     /// Per-pass GPU timing, when started with `--profile`.
     profiler: Option<GpuProfiler>,
 }
@@ -132,6 +168,10 @@ impl BoidsApp {
         };
         let sim_config = SimConfig::for_mode(mode, startup.num_agents);
         let camera = OrbitCamera {
+            // The orbit target is the swarm's spawn centre rather than the world's origin: in the sky
+            // world the ground rises above y = 0, so a camera aimed at the origin would look at a
+            // hillside with the flock off the top of the frame.
+            target: sim_config.spawn_center,
             distance: sim_config.bounds_half.length() * 0.8,
             ..Default::default()
         };
@@ -149,6 +189,7 @@ impl BoidsApp {
             smoothed_frame_time: 1.0 / 60.0,
             last_frame: None,
             frames: 0,
+            morph: None,
             profiler: None,
         }
     }
@@ -193,6 +234,7 @@ impl BoidsApp {
         let renderer = Renderer::new(
             &gpu,
             [&resources.boids[0], &resources.boids[1]],
+            &self.sim_config,
             surface.config.format,
             surface.is_srgb,
             size.width,
@@ -289,12 +331,26 @@ impl BoidsApp {
     /// Builds the scene uniform for this frame.
     fn scene_uniform(&self, viewport: Vec2) -> SceneUniform {
         let camera: CameraUniform = self.camera.to_uniform(self.sim_time, viewport);
-        boids_gpu::mesh_profile::scene_uniform(
-            camera,
-            self.sim_config.mode,
-            self.sim_config.max_speed,
-            self.sim_config.r_percept,
-        )
+        // During a world switch the agent shape is the only thing that blends; the world itself is
+        // already the destination, which is what lets the creatures morph across the cut.
+        match self.morph {
+            Some(morph) => boids_gpu::mesh_profile::scene_uniform_morph(
+                camera,
+                morph.from,
+                morph.to,
+                morph.eased(),
+                morph.from_speed,
+                morph.from_percept,
+                morph.to_speed,
+                morph.to_percept,
+            ),
+            None => boids_gpu::mesh_profile::scene_uniform(
+                camera,
+                self.sim_config.mode,
+                self.sim_config.max_speed,
+                self.sim_config.r_percept,
+            ),
+        }
     }
 
     /// The timestep for this frame.
@@ -313,19 +369,33 @@ impl BoidsApp {
         dt.clamp(1.0 / 480.0, 1.0 / 20.0)
     }
 
-    /// Switches worlds without touching the device.
+    /// Switches worlds without touching the device, and starts the agent morph.
     fn toggle_world(&mut self) {
-        let mode = match self.sim_config.mode {
+        let from = self.sim_config.mode;
+        let to = match from {
             SimMode::Fish => SimMode::Birds,
             SimMode::Birds => SimMode::Fish,
         };
-        self.sim_config = SimConfig::for_mode(mode, self.startup.num_agents);
+        let next = SimConfig::for_mode(to, self.startup.num_agents);
+        // The morph starts from the current world's shape and scale, even if a switch is already in
+        // progress: a second key press redirects the transition rather than queueing one.
+        self.morph = Some(WorldMorph {
+            from: self.morph.map_or(from, |m| m.from),
+            to,
+            from_speed: self.morph.map_or(self.sim_config.max_speed, |m| m.from_speed),
+            to_speed: next.max_speed,
+            from_percept: self.morph.map_or(self.sim_config.r_percept, |m| m.from_percept),
+            to_percept: next.r_percept,
+            t: 0.0,
+        });
+        self.sim_config = next;
         // Respawn: the two worlds have different bounds and speeds, and carrying agents across would
-        // leave them outside the new world's grid and immediately clamped into the border cells.
+        // leave them outside the new world's grid and immediately clamped into the border cells. The
+        // visual morph hides the change of bodies, not the change of world.
         self.respawn();
-        self.camera.target = Vec3::ZERO;
+        self.camera.target = self.sim_config.spawn_center;
         self.camera.distance = self.sim_config.bounds_half.length() * 0.8;
-        log::info!("switched to {:?}", mode);
+        log::info!("morphing {from:?} -> {to:?} over {MORPH_SECONDS}s");
     }
 
     /// Respawns the swarm in the current world.
@@ -422,6 +492,7 @@ impl BoidsApp {
             water: boids_scene::water_params(&self.sim_config),
             interaction: self.interaction(viewport),
             post: boids_scene::post_params(self.sim_config.mode, self.sim_time),
+            sky: boids_scene::sky_params(self.sim_config.mode),
         };
 
         let Some(surface) = &mut self.surface else {
@@ -595,6 +666,15 @@ impl BoidsApp {
         // Exponential smoothing with a short time constant: a raw per-frame number is unreadable, and
         // a long average hides the hitches worth seeing.
         self.smoothed_frame_time = self.smoothed_frame_time * 0.9 + dt * 0.1;
+
+        // The morph advances on real time, not simulation time, so pausing the swarm does not freeze
+        // the transition half-way through.
+        if let Some(morph) = &mut self.morph {
+            morph.t += dt / MORPH_SECONDS;
+            if morph.t >= 1.0 {
+                self.morph = None;
+            }
+        }
 
         if !self.input.paused {
             self.step_simulation(dt);

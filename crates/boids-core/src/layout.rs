@@ -140,7 +140,7 @@ pub struct SortParams {
 /// | 80     | `bounds_half`, `mode` | `bounds_half: vec3<f32>`, `mode: u32` |
 /// | 96     | `wander`, `sep_boost`, `coh_falloff`, `r_safe` | same names |
 /// | 112    | `buoyancy`, `drag`, `env_scale`, `env_floor_y` | same names |
-/// | 128    | `env_id`, `_pad0`..`_pad2` | `env_id: u32`, then padding |
+/// | 128    | `env_id`, `env_freq`, `_pad1`, `_pad2` | `env_id: u32`, `env_freq: f32`, padding |
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct SimParams {
@@ -188,9 +188,10 @@ pub struct SimParams {
 
     /// Wander force scale.
     pub wander: f32,
-    /// Extra separation multiplier in crowded cells.
+    /// Reciprocal of `density_ref`, turning a neighbour count into a density ratio.
     pub sep_boost: f32,
-    /// Cohesion damping exponent for crowded cells.
+    /// Density-feedback exponent (`density_gain`): `push = density^coh_falloff`. Zero gives fixed
+    /// weights, one the proportional feedback, larger values swing harder.
     pub coh_falloff: f32,
     /// Safe distance kept from SDF surfaces, meters.
     pub r_safe: f32,
@@ -207,13 +208,18 @@ pub struct SimParams {
     /// Avoidance field selector, mirroring [`EnvironmentKind`]:
     /// 0 = none, 1 = reef (`sdf::reef_field`), 2 = terrain (`terrain::height_at`).
     pub env_id: u32,
+    /// Terrain base noise frequency, m^-1 (`terrain::height_at`'s second argument). Unused by the
+    /// reef, whose scale is `env_scale`.
+    ///
+    /// It lives in `SimParams` rather than in the render-side `TerrainParams` because the
+    /// *simulation* needs it and never sees a render struct: the surface an agent avoids and the
+    /// surface the camera draws have to be the same field evaluated with the same frequency.
+    pub env_freq: f32,
     /// Explicit padding keeping the struct 144 bytes and free of implicit padding. `bytemuck`
     /// refuses to derive `Pod` for a struct with padding, so any new field must keep each 16-byte
     /// block exactly full or the crate stops compiling.
-    pub _pad0: f32,
-    /// Explicit padding, see `_pad0`.
     pub _pad1: f32,
-    /// Explicit padding, see `_pad0`.
+    /// Explicit padding, see `_pad1`.
     pub _pad2: f32,
 }
 
@@ -326,10 +332,15 @@ pub struct MeshParams {
     /// sized for a hundred thousand agents and as a solid wall in a small one. The host derives it from
     /// the perception radius, so an agent always occupies a similar share of the space it can see.
     pub scale: f32,
+    /// Which medium attenuates the agent: 0 = the underwater per-channel model, 1 = the aerial haze.
+    ///
+    /// The host sets this to the *destination* world's medium during a morph while `variant` blends
+    /// the body, so the creature keeps the light it is actually flying through instead of fading
+    /// through the pale in-scatter of a medium it has already left. It lives in what was padding: the
+    /// struct has room for one more scalar and this is the one the shader needs.
+    pub medium: f32,
     /// Explicit padding keeping the struct 80 bytes, and keeping it free of implicit padding so that
     /// `bytemuck` will derive `Pod`: every 16-byte block must be exactly full.
-    pub _pad_a: f32,
-    /// Explicit padding, see `_pad_a`.
     pub _pad_b: f32,
 }
 
@@ -439,6 +450,101 @@ pub struct PostParams {
     pub lift: f32,
 }
 
+/// The sky world's land: the heightfield map, the mesh that draws it and the vegetation on it.
+///
+/// One struct rather than three because its consumers describe the same piece of ground: the
+/// heightfield generator writes the map, the terrain mesh reads it back through the same
+/// `amplitude` and `frequency` the simulation's collision field uses, and the scatter pass places
+/// trees on it. Splitting them would allow a mesh built from one amplitude and a collision field
+/// built from another, which is exactly the divergence the shared-field tests exist to prevent.
+///
+/// Mirrored in WGSL as `TerrainParams`. 48 bytes, twelve scalars and two `vec2`s.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct TerrainParams {
+    /// World `xz` of the map's minimum corner.
+    pub min_xz: [f32; 2],
+    /// World size the map covers, metres.
+    pub size_xz: [f32; 2],
+
+    /// Height scale, metres. Equal to the simulation's `env_scale` for the terrain field.
+    pub amplitude: f32,
+    /// Base noise frequency, m^-1. Equal to the simulation's `env_freq`.
+    pub frequency: f32,
+    /// Biome cell frequency, m^-1.
+    pub biome_frequency: f32,
+    /// Mesh segments per axis: `segments^2 * 2` triangles.
+    pub segments: u32,
+
+    /// Height a drawn tree reaches above the ground, metres. Zero disables the tree pass.
+    pub tree_height: f32,
+    /// Instance slots in the tree buffer.
+    pub tree_capacity: u32,
+    /// Scatter candidates per axis. The capacity is a small fraction of `candidates^2`.
+    pub tree_candidates: u32,
+    /// Texels per axis of the baked map.
+    ///
+    /// Carried in the uniform rather than queried with `textureDimensions`: the generating pass
+    /// writes a *storage* texture, and sizing one needs the `IMAGE_SIZE` feature, which the GL
+    /// backend does not offer.
+    pub resolution: u32,
+}
+
+/// Analytic single-scattering atmosphere for the sky world.
+///
+/// Mirrored in WGSL as `SkyParams`. 48 bytes, twelve scalars.
+///
+/// The coefficients are physical (metres^-1) rather than artistic: they describe air, and the two
+/// numbers that decide the look are `sun_intensity` and `horizon_boost`. See `docs/math.md` for the
+/// integral this approximates and why one flat-atmosphere term is enough at this world's scale.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct SkyParams {
+    /// Rayleigh scattering coefficient, m^-1. Strong in blue, which is why the sky is blue.
+    pub beta_rayleigh: [f32; 3],
+    /// Sun radiance scale. The only free knob in the model.
+    pub sun_intensity: f32,
+
+    /// Mie scattering coefficient, m^-1: the aerosol term, nearly grey.
+    pub beta_mie: [f32; 3],
+    /// Henyey-Greenstein anisotropy of the Mie term. 0.76 is the usual forward-scattering haze.
+    pub mie_g: f32,
+
+    /// Rayleigh scale height, metres.
+    pub ray_scale_height: f32,
+    /// Mie scale height, metres.
+    pub mie_scale_height: f32,
+    /// Extra brightness within a few degrees of the horizon, where a line of sight crosses most air.
+    pub horizon_boost: f32,
+    /// Multiplier on the in-scattered light distant geometry fades into.
+    pub aerial_boost: f32,
+}
+
+/// One scattered tree: a base position, an orientation and a variant.
+///
+/// Mirrored in WGSL as `TreeInstance`. 32 bytes so the array stride stays a multiple of 16. This is
+/// a storage element rather than a uniform: the scatter pass appends to an array of them and the
+/// tree pass draws however many were accepted.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct TreeInstance {
+    /// Base position, on the ground, metres.
+    pub pos: [f32; 3],
+    /// Uniform scale.
+    pub scale: f32,
+
+    /// Rotation about Y, radians.
+    pub yaw: f32,
+    /// Species/variant selector in `[0, 1)`, from the scatter hash.
+    pub kind: f32,
+    /// Biome mask under the trunk, in `[0, 2)`. Stored rather than re-sampled by the draw pass: the
+    /// scatter pass already had it in hand, and the draw pass would otherwise pay a texel load per
+    /// vertex to learn what colour it is.
+    pub mask: f32,
+    /// Explicit padding, see [`SimParams::_pad1`].
+    pub pad1: f32,
+}
+
 /// Which environment field the simulation avoids. Mirrors the `ENV_*` constants in WGSL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
@@ -497,6 +603,15 @@ const _: () = {
 
     assert!(core::mem::size_of::<PostParams>() == 48);
     assert!(core::mem::align_of::<PostParams>() == 16);
+
+    assert!(core::mem::size_of::<TerrainParams>() == 48);
+    assert!(core::mem::align_of::<TerrainParams>() == 16);
+
+    assert!(core::mem::size_of::<SkyParams>() == 48);
+    assert!(core::mem::align_of::<SkyParams>() == 16);
+
+    assert!(core::mem::size_of::<TreeInstance>() == 32);
+    assert!(core::mem::align_of::<TreeInstance>() == 16);
 };
 
 /// Field offsets of every GPU struct, as the host sees them.

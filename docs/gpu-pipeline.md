@@ -46,8 +46,9 @@ a longer history.
 | 112 | `buoyancy`, `drag`, `env_scale`, `env_floor_y` |
 | 128 | `env_id: u32`, three explicit padding scalars |
 
-`sep_boost` and `coh_falloff` are reciprocals of `density_ref` rather than the value itself, because
-the shader multiplies by them once per agent per frame and a division there would be paid 100k times.
+`sep_boost` is stored as the reciprocal of `density_ref` because the shader multiplies by it once per
+agent per frame and a division there would be paid 100k times. `coh_falloff` is the density-feedback
+exponent `density_gain`: 0 disables the feedback, 1 is proportional, and larger values swing harder.
 
 ### `InteractionUniforms` - 48 bytes, uniform
 
@@ -109,16 +110,20 @@ writes the swapchain (`ADR-0004`).
 | target | format | size @1440p | usage |
 |---|---|---|---|
 | HDR scene | `Rgba16Float` | 12.6 MB | RENDER_ATTACHMENT, TEXTURE_BINDING |
-| depth | `Depth32Float` | 7.9 MB | RENDER_ATTACHMENT (writable depth for the ocean's `frag_depth`) |
+| depth | `Depth32Float` | 7.9 MB | RENDER_ATTACHMENT (`frag_depth` written by the ocean resolve) |
+| ocean half-res | `Rgba16Float` | 720p | RENDER_ATTACHMENT, TEXTURE_BINDING (alpha = hit metres) |
 | bloom level 0..2 | `Rgba16Float` | 720p / 360p / 180p | RENDER_ATTACHMENT, TEXTURE_BINDING |
 
 `Rgba16Float` rather than `Rgba32Float`: the scene contains values far above 1.0 (caustics, the surface,
 bioluminescence) and half-float keeps both the range and the *exponent*, at half the bandwidth. The
 format is chosen once, in `targets.rs`, and every geometry pipeline is built against it. `Depth32Float`
 rather than `Depth24PlusStencil8`: nothing uses stencil, and the ocean raymarch writes real distances
-in the hundreds of metres into this buffer, so the extra precision matters. The bloom pyramid is
-recreated whenever the target size changes, with every bind group that references a level, so a resize
-cannot leave half the chain pointing at a previous size.
+in the hundreds of metres into this buffer, so the extra precision matters. The ocean target is half
+the scene per axis: the raymarch is the most expensive pass and its result is smooth, so its alpha
+channel carries the hit distance in metres and `render/ocean_resolve.wgsl` turns that into full-size
+colour and `frag_depth`. The bloom pyramid is recreated whenever the target size changes, with every
+bind group that references a level, so a resize cannot leave half the chain pointing at a previous
+size; the ocean resolve's bind group is rebuilt the same way.
 
 ## Bind groups
 
@@ -264,26 +269,34 @@ it is genuinely faster than a grid plus its sort, and as the reference the grid 
 
 ### Render passes
 
-One frame is one scene render pass plus the post chain. The environment and the agents share one pass
-and one depth attachment, which is what lets a fish sit behind a column:
+One frame is one half-size ocean pre-pass, one scene render pass, and the post chain. The environment
+and the agents share the scene pass and its depth attachment, which is what lets a fish sit behind a
+column:
 
 ```
-scene pass (HDR target + depth, depth cleared to 1.0)
-  1. environment   Fish:  ocean.wgsl       draw(0..3, 0..1)   compare Always, frag_depth written
-                   Birds: background.wgsl  draw(0..3, 0..1)   compare Always, no depth write
-  2. agents        boid.wgsl               draw(0..66, 0..num_boids)  compare LessEqual, depth write
+ocean pre-pass (half-res HDR, no depth, Fish only)
+  0. raymarch      ocean.wgsl           draw(0..3, 0..1)   rgb = medium, a = hit metres
+scene pass (full HDR target + depth, depth cleared to 1.0)
+  1. environment   Fish:  ocean_resolve.wgsl draw(0..3, 0..1)  compare Always, frag_depth written
+                   Birds: background.wgsl    draw(0..3, 0..1)  compare Always, no depth write
+  2. ground        terrain.wgsl              draw(0..segments^2*6, 0..1)  Birds only
+  3. trees         tree.wgsl                 draw(0..tree_count*idx, 0..1)  Birds only
+  4. agents        boid.wgsl                 draw(0..66, 0..num_boids)  compare LessEqual, depth write
 post chain (no depth)
-  3. bloom bright  draw(0..3, 0..1)   hdr -> bloom[0]
-  4. bloom down    draw(0..3, 0..1)   bloom[i-1] -> bloom[i]
-  5. bloom up      draw(0..3, 0..1)   bloom[i] -> bloom[i-1], additive
-  6. composite     draw(0..3, 0..1)   hdr + bloom[0] -> swapchain
+  5. bloom bright  draw(0..3, 0..1)   hdr -> bloom[0]
+  6. bloom down    draw(0..3, 0..1)   bloom[i-1] -> bloom[i]
+  7. bloom up      draw(0..3, 0..1)   bloom[i] -> bloom[i-1], additive
+  8. composite     draw(0..3, 0..1)   hdr + bloom[0] -> swapchain
 ```
 
 The underwater environment writes `frag_depth` from the raymarched hit (`ADR-0005`), so the agent
 pipeline's `LessEqual` test against the 1.0 clear rejects a fish behind rock and keeps one in front of
-the seafloor. The ocean pass runs first and with `CompareFunction::Always`, so it overwrites the clear
-rather than testing against it. The sky backdrop writes no depth, so birds depth-test only against each
-other.
+the seafloor. The distance travels through the half-size pre-pass in the colour target's alpha channel
+because a depth texture cannot be sampled portably on every backend, and the resolve derives NDC depth
+from the metric distance at full precision. It runs first in the scene pass and with
+`CompareFunction::Always`, so it overwrites the clear rather than testing against it. The sky backdrop
+writes no depth; the terrain and the trees do, so a bird depth-tests against the ridge and the forest as
+well as against the flock.
 
 No pass has a vertex buffer. The agent mesh is a pure function of `vertex_index` (22 triangles: a
 body, a tail fin, and two wing triangles that are degenerate for fish), and the per-agent transform

@@ -139,13 +139,13 @@ fn mesh_vertex(vi: u32, m: MeshParams) -> vec3<f32> {
         return tail_fin_vertex(tri - 16u, corner, m);
     }
 
-    if (m.variant < 0.5) {
-        // Degenerate: fish have no wings.
-        return vec3<f32>(0.0, 0.0, 0.0);
-    }
     let s = (tri - 18u) / 2u;
     let side = select(1.0, -1.0, (tri - 18u) % 2u == 0u);
-    return wing_vertex(s, corner, side, m);
+    // The wing grows out of the body as the world morphs from fish to bird: at `variant` 0 every
+    // corner collapses onto the origin and the triangle is degenerate, at 1 it is a full wing. This
+    // is continuous, unlike the `variant < 0.5` switch it replaces, because a morph has to pass
+    // through the middle.
+    return mix(vec3<f32>(0.0), wing_vertex(s, corner, side, m), m.variant);
 }
 
 // Applies the swimming / flapping deformation in local space.
@@ -155,19 +155,26 @@ fn mesh_vertex(vi: u32, m: MeshParams) -> vec3<f32> {
 // Birds: the wings rotate about the body axis by a single flapping sine; the body itself stays
 // rigid so the silhouette does not wobble.
 fn animate_local(p_in: vec3<f32>, phase: f32, m: MeshParams) -> vec3<f32> {
-    var p = p_in;
     let t = scene.camera.time * m.wave_freq + phase;
-    if (m.variant < 0.5) {
-        let along = clamp(-p.z, 0.0, 1.2);
-        p.x = p.x + sin(t - along * 2.0) * m.wave_amp * along * along;
-        return p;
-    }
-    if (abs(p.x) > 1e-5) {
-        let side = sign(p.x);
+
+    // Fish: a lateral wave running from nose to tail whose amplitude grows quadratically toward the
+    // tail, which is what an actual swimming body does.
+    let along = clamp(-p_in.z, 0.0, 1.2);
+    var fish = p_in;
+    fish.x = fish.x + sin(t - along * 2.0) * m.wave_amp * along * along;
+
+    // Birds: the wings rotate about the body axis by a single flapping sine; the body stays rigid so
+    // the silhouette does not wobble.
+    var bird = p_in;
+    if (abs(p_in.x) > 1e-5) {
+        let side = sign(p_in.x);
         let flap = sin(t) * m.wave_amp;
-        p = rotate_axis(p, vec3<f32>(0.0, 0.0, 1.0), side * flap);
+        bird = rotate_axis(p_in, vec3<f32>(0.0, 0.0, 1.0), side * flap);
     }
-    return p;
+
+    // Both deformations run and are mixed by the morph factor. At 0 or 1 one of them is wasted, which
+    // is the price of a continuous transition; a branch would make the creature snap at the midpoint.
+    return mix(fish, bird, clamp(m.variant, 0.0, 1.0));
 }
 
 // Bank angle from the change of heading, in radians.
@@ -259,11 +266,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // reads as depth underwater. Air scatters roughly uniformly, so the sky world gets the single-
     // coefficient aerial haze instead. The fish branch uses exactly the same model as the raymarched
     // medium in `render/ocean.wgsl`, so a fish and the water around it can never disagree.
-    if (scene.mesh.variant < 0.5) {
-        color = water_medium(color, distance);
-    } else {
-        color = mix(color, scene.fog_color, medium_blend(distance));
-    }
+    //
+    // The choice of medium comes from `mesh.medium`, which is the *destination* world's, while the
+    // body shape is blended by `mesh.variant` on its own clock. Tying both to `variant` made an agent
+    // morphing into the sky keep the water medium half the time, which at the sky world's distances
+    // washed it out in the water's pale in-scatter.
+    let underwater = water_medium(color, distance);
+    let aerial = aerial_perspective(color, to_eye, distance, scene, sky);
+    color = mix(underwater, aerial, clamp(scene.mesh.medium, 0.0, 1.0));
 
     return vec4<f32>(color, 1.0);
 }

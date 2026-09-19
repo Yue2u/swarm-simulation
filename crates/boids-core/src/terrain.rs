@@ -75,16 +75,30 @@ pub fn value_noise(p: Vec2) -> f32 {
     a + (b - a) * w.y
 }
 
+/// Frequency of the domain warp relative to the terrain's own, and how far it displaces the field, in
+/// lattice cells of the base octave.
+///
+/// The warp is what turns a sum of smooth bumps into ridges and valleys, and it has to be *smooth* to
+/// do that: an earlier version hashed the cell containing the sample, which made the warp jump six
+/// lattice cells every 1.4 metres and turned the whole field into bounded white noise. It looked
+/// plausible in a boundedness test and was unmistakable the first time the field was shaded, which is
+/// what the render checks exist to catch.
+const WARP_FREQUENCY: f32 = 0.5;
+/// See [`WARP_FREQUENCY`].
+const WARP_AMOUNT: f32 = 2.0;
+
 /// Domain-warped fractal noise in `[0, 1]`.
 #[must_use]
 pub fn fbm_warped(p: Vec2, frequency: f32) -> f32 {
-    // The warp offset is derived from the same hash so the CPU and the GPU see the same field.
+    // Two smooth low-frequency noises offset the sampling position. Both sides evaluate the same two
+    // `value_noise` calls, so the CPU and the GPU see the same field.
+    let warp_scale = frequency * WARP_FREQUENCY;
     let warp = Vec2::new(
-        hash21(p * 0.7 + Vec2::new(11.3, 4.7)),
-        hash21(p * 0.7 + Vec2::new(3.1, 19.9)),
+        value_noise(p * warp_scale + Vec2::new(11.3, 4.7)),
+        value_noise(p * warp_scale + Vec2::new(3.1, 19.9)),
     ) * 2.0
         - Vec2::ONE;
-    let q = p * frequency + warp * 6.0;
+    let q = p * frequency + warp * WARP_AMOUNT;
 
     let mut h = 0.0;
     let mut amp = 1.0;
@@ -156,26 +170,119 @@ pub fn dominant_biome(p: Vec2, frequency: f32) -> usize {
     }
 }
 
+/// Biome coordinate in `[0, 2)`: 0 = forest, 1 = dunes, 2 = canyon, continuous across a transition.
+///
+/// Derived from [`biome_weights`] rather than hashed on its own so that the heightfield's mask
+/// channel and the weights cannot disagree. Because the three weights sum to 1, the map is a sweep:
+/// at a forest/dunes boundary `w.z` is 0 and the mask runs 0 -> 1, and at a dunes/canyon boundary
+/// `w.y` is 0 and it runs 1 -> 2.
+///
+/// One scalar is all the heightfield's second channel has room for, and one scalar is all a
+/// three-stop palette ramp needs. Mirrors `biome_mask` in `shaders/common/sdf.wgsl`.
+#[must_use]
+pub fn biome_mask(p: Vec2, frequency: f32) -> f32 {
+    let w = biome_weights(p, frequency);
+    w.y + 2.0 * w.z
+}
+
+/// Base noise frequency, m^-1, for a world of half-extent `half_extent`.
+///
+/// The terrain is *world-relative* rather than absolute: the same expression has to produce
+/// mountains across a 1.2 km world and hills across a 250 m test world, and a fixed frequency would
+/// give one of them a single featureless slope. `TERRAIN_FEATURES` is how many base-wavelength
+/// features span the world, which is a property of the look rather than of the world's size.
+///
+/// Mirrors `boids_core`'s use on the host: the value ends up in `SimParams::env_freq` and
+/// `TerrainParams::frequency`, and both sides call [`height_at`] with it.
+#[must_use]
+pub fn frequency_for_extent(half_extent: f32) -> f32 {
+    const TERRAIN_FEATURES: f32 = 3.0;
+    TERRAIN_FEATURES / (2.0 * half_extent).max(1.0)
+}
+
+/// Height amplitude, metres, for a world of half-height `half_height`.
+///
+/// A third of the world's half-height. That leaves the top two thirds of the box as open air, which
+/// is what the spawn cluster needs: the swarm is placed above the *maximum* terrain height with a
+/// clearance, and a taller ridge would leave too little air for a cluster at the reference density
+/// and force it to compress (see `spawn::swarm_extent`). A ridge that reaches half the world, which
+/// this used to be, left the spawn cluster with a quarter of the box and squashed it into a dense
+/// knot. Mirrors what `SimConfig::for_mode` puts in `env_scale` for the terrain field.
+#[must_use]
+pub fn amplitude_for_extent(half_height: f32) -> f32 {
+    half_height * 0.3
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn height_is_bounded_and_finite() {
-        let mut min = f32::INFINITY;
-        let mut max = f32::NEG_INFINITY;
-        for i in 0..2000 {
+/// The field has to be *smooth*, not merely bounded.
+///
+/// This catches the failure mode a boundedness test cannot: a domain warp that is not smooth. Hashing
+/// the sample's own cell makes the warp jump by whole lattice cells from one metre to the next, so the
+/// field becomes bounded white noise with the terrain's full amplitude. Every boundedness assertion
+/// passes, and the moment it is shaded it is a field of needles.
+#[test]
+fn height_field_is_lipschitz() {
+    for (half, label) in [(600.0f32, "app"), (126.0, "test")] {
+        let amplitude = amplitude_for_extent(half * 1.83);
+        let frequency = frequency_for_extent(half);
+        let mut worst = 0.0f32;
+        let mut worst_at = Vec2::ZERO;
+        for i in 0..4000 {
             #[allow(clippy::cast_precision_loss)]
             let t = i as f32 * 0.37;
-            let h = height_at(Vec2::new(t, t * 0.6 - 12.0), 90.0, 0.0025);
-            assert!(h.is_finite(), "height not finite at t={t}");
-            min = min.min(h);
-            max = max.max(h);
+            let p = Vec2::new((t * 1.7).sin() * half, (t * 0.9).cos() * half);
+            let e = Vec2::new(0.5, -0.5);
+            let slope = (height_at(p + e, amplitude, frequency) - height_at(p, amplitude, frequency))
+                .abs()
+                / e.length();
+            if slope > worst {
+                worst = slope;
+                worst_at = p;
+            }
         }
-        assert!(min >= 0.0 && max <= 90.0, "height range [{min}, {max}] escaped");
-        // It must actually vary, otherwise the terrain is a plane and every scatter test passes
-        // for the wrong reason.
-        assert!(max - min > 10.0, "height field is nearly flat: {min}..{max}");
+        eprintln!("{label} world: steepest half-metre slope {worst:.2} at {worst_at:?}");
+        assert!(
+            worst < 4.0,
+            "{label} world: a half-metre step changes the height by {worst} metres, so the field is \
+             not smooth. A domain warp that is not smooth is the usual cause."
+        );
+    }
+}
+
+
+    #[test]
+    fn height_is_bounded_and_varies_across_the_world() {
+        let (half, amplitude) = (600.0f32, 110.0f32);
+        let frequency = frequency_for_extent(half);
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        // A grid rather than a line: a single line can miss every feature of a field whose features
+        // are hundreds of metres across, and then the check passes while measuring nothing.
+        for i in 0..40 {
+            for j in 0..40 {
+                #[allow(clippy::cast_precision_loss)]
+                let p = Vec2::new(
+                    -half + 2.0 * half * (i as f32) / 39.0,
+                    -half + 2.0 * half * (j as f32) / 39.0,
+                );
+                let h = height_at(p, amplitude, frequency);
+                assert!(h.is_finite(), "height not finite at {p:?}");
+                min = min.min(h);
+                max = max.max(h);
+            }
+        }
+        assert!(
+            min >= 0.0 && max <= amplitude,
+            "height range [{min}, {max}] escaped [0, {amplitude}]"
+        );
+        // It must actually vary, otherwise the terrain is a plane and every scatter test passes for
+        // the wrong reason.
+        assert!(
+            max - min > amplitude * 0.4,
+            "height field spans only {min}..{max} across the world"
+        );
     }
 
     #[test]

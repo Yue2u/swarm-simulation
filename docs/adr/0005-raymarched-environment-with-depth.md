@@ -27,13 +27,18 @@ the seafloor, fused with `smin`) that is unbounded and procedural. The identical
 `integrate_grid`'s avoidance term and by the render pass, so there is one rock, not two. The CPU twin in
 `boids-core/src/sdf.rs` is kept in step by the `sdf/wgsl_matches_rust` device test.
 
-**A full-screen sphere trace writes `frag_depth`.** `render/ocean.wgsl` runs before the agents, marches
-the field at up to 80 steps, and writes the clip-space depth of the hit by hand through
-`@builtin(frag_depth)`. The agent pipeline's `LessEqual` test then does the rest: a fish behind a column
-is rejected, a fish in front of the seafloor is kept. A separate depth prepass would rasterise the same
-field twice; painter's-order sorting does not work for a field with no enumerable primitives. Rays that
-hit nothing write 1.0, the far plane, rather than writing nothing, so a caller-provided depth target
-cannot keep the previous frame's value.
+**A half-resolution sphere trace, resolved full-screen into `frag_depth`.** `render/ocean.wgsl` marches
+the field at up to 80 steps into a half-size `Rgba16Float` target whose alpha channel is the hit distance
+in metres, and `render/ocean_resolve.wgsl` upsamples the colour and writes the clip-space depth of the
+hit by hand through `@builtin(frag_depth)`. The agent pipeline's `LessEqual` test then does the rest: a
+fish behind a column is rejected, a fish in front of the seafloor is kept. Running the integral at half
+resolution (day 4) is a factor of four on the most expensive pass; the distance rides in alpha rather
+than a depth attachment because sampling a `texture_depth_2d` is not portable to the GL backend, and a
+metric distance keeps more usable precision in a half-float channel than an NDC depth would. A separate
+depth prepass would rasterise the same field twice; painter's-order sorting does not work for a field
+with no enumerable primitives. Rays that hit nothing leave distance 0 and the resolve writes 1.0, the far
+plane, rather than writing nothing, so a caller-provided depth target cannot keep the previous frame's
+value.
 
 **Sphere tracing is damped because the field repeats.** A plain `t += sdf(p)` is only safe while the
 field's Lipschitz constant is at most 1; at a domain-repetition boundary the value can jump upward, so
@@ -65,8 +70,9 @@ ADR-0004's bloom then spreads.
 **Negative.**
 
 * The pass is the most expensive in the frame: up to 80 field evaluations for the march, six more for
-  the shading normal, plus the shaft samples. `docs/perf.md` tracks it separately, and half-resolution
-  rendering is the planned lever if the target frame budget needs it.
+  the shading normal, plus the shaft samples. It is rendered at half resolution into its own target
+  (day 4), which cuts its pixel cost fourfold; the remaining levers are the shaft sample count and the
+  march step cap. `docs/perf.md` tracks it separately.
 * The damped marching rule is a heuristic. A field with a sharper repetition would need a smaller
   safety factor, and at some point sphere tracing is the wrong tool and a different representation is.
 * The medium model is an approximation of a volumetric integral, shaded at the hit only. It is

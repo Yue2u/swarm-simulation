@@ -7,30 +7,51 @@
 //   @binding(2) water       uniform WaterParams         (underwater medium and reef geometry)
 //   @binding(3) interaction uniform InteractionUniforms (cursor attractor/repeller, for the marker)
 //   @binding(4) post        uniform PostParams          (exposure, bloom, lens terms)
+//   @binding(5) terrain     uniform TerrainParams       (heightfield geometry and vegetation)
+//   @binding(6) heightfield texture_2d<f32>             (baked height in r, biome mask in g)
+//   @binding(7) trees       storage array<TreeInstance> (read, scattered by the terrain scatter pass)
+//   @binding(8) sky         uniform SkyParams           (atmospheric scattering coefficients)
 //
 // The boid array is bound as a *storage buffer* rather than a vertex buffer, and the vertex shader
 // indexes it with `instance_index`. That is what makes instanced drawing of 100k agents possible
 // without a per-frame upload or an instancing vertex buffer: the simulation already produced the data
 // on the GPU and the draw call reads it where it lies.
 //
-// `water`, `interaction` and `post` are here rather than in pass-specific groups for the same reason
-// the simulation keeps its uniforms in one group: every pass that draws scene geometry or shades the
-// medium needs some of them, and one group means one bind group set per pass instead of several. The
-// post passes (bloom, composite) do *not* use this group; they sample textures and have their own.
+// `water`, `interaction`, `post`, `terrain`, `heightfield`, `trees` and `sky` are here rather than in
+// pass-specific groups for the same reason the simulation keeps its uniforms in one group: several
+// passes need some of them, and one group means one bind group set per pass instead of several. A
+// pass that needs none of them (the bloom pyramid) still binds the group, which costs a bind and no
+// bandwidth. The post passes (bloom, composite) do *not* use this group; they sample textures and
+// have their own.
 //
 // Header only: declares bindings and pure helpers, no entry points.
 
 //#include "common/sdf.wgsl"
+//#include "common/heightfield.wgsl"
+//#include "common/atmosphere.wgsl"
 
 @group(0) @binding(0) var<uniform> scene: SceneUniform;
 @group(0) @binding(1) var<storage, read> boids: array<Boid>;
 @group(0) @binding(2) var<uniform> water: WaterParams;
 @group(0) @binding(3) var<uniform> interaction: InteractionUniforms;
 @group(0) @binding(4) var<uniform> post: PostParams;
+@group(0) @binding(5) var<uniform> terrain: TerrainParams;
+@group(0) @binding(6) var heightfield: texture_2d<f32>;
+@group(0) @binding(7) var<storage, read> trees: array<TreeInstance>;
+@group(0) @binding(8) var<uniform> sky: SkyParams;
 
 // ---------------------------------------------------------------------------------------------
 // Shared scene helpers
 // ---------------------------------------------------------------------------------------------
+
+// The reef field's arguments, for every pass that marches or shades the underwater environment.
+//
+// The reef's scale parameters live in the water uniform, which the host fills from the same
+// `SimConfig` the simulation's `SimParams` come from, so the rock an agent avoids and the rock the
+// camera draws stay one field. `freq` is the terrain's, and is unused by the reef.
+fn reef_args() -> FieldArgs {
+    return FieldArgs(ENV_REEF, water.reef_period, 0.0, water.floor_y);
+}
 
 // Depth-cue / medium extinction for the *air* worlds: `1 - exp(-density * distance)`.
 //

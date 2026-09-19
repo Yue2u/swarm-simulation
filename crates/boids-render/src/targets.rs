@@ -30,6 +30,14 @@ pub struct FrameTargets {
     hdr_view: wgpu::TextureView,
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    /// The underwater raymarch's own, half-resolution colour target. The raymarch is by far the most
+    /// expensive pass in the frame and it is a full-screen integral; rendering it at half resolution
+    /// and upsampling is a factor of four on its pixel cost for a soft image that a bilinear tap
+    /// hides. The alpha channel carries the ray's hit distance in metres, because a depth texture
+    /// cannot be sampled portably in the resolve shader on every backend.
+    ocean: wgpu::Texture,
+    ocean_view: wgpu::TextureView,
+    ocean_size: (u32, u32),
     /// Current size in physical pixels.
     pub size: (u32, u32),
 }
@@ -67,11 +75,32 @@ impl FrameTargets {
             view_formats: &[],
         });
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let ocean_size = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
+        let ocean = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ocean half-res"),
+            size: wgpu::Extent3d {
+                width: ocean_size.0,
+                height: ocean_size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let ocean_view = ocean.create_view(&wgpu::TextureViewDescriptor::default());
+
         Self {
             hdr,
             hdr_view,
             depth,
             depth_view,
+            ocean,
+            ocean_view,
+            ocean_size,
             size: (width, height),
         }
     }
@@ -104,6 +133,24 @@ impl FrameTargets {
     #[must_use]
     pub fn depth_view(&self) -> &wgpu::TextureView {
         &self.depth_view
+    }
+
+    /// View of the half-resolution ocean target: the raymarch writes it, the resolve samples it.
+    #[must_use]
+    pub fn ocean_view(&self) -> &wgpu::TextureView {
+        &self.ocean_view
+    }
+
+    /// Size of the ocean target, in texels.
+    #[must_use]
+    pub const fn ocean_size(&self) -> (u32, u32) {
+        self.ocean_size
+    }
+
+    /// The ocean texture, exposed for tests that need its format or size.
+    #[must_use]
+    pub fn ocean_texture(&self) -> &wgpu::Texture {
+        &self.ocean
     }
 
     /// The depth texture, exposed for passes that need its size.

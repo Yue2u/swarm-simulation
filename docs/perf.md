@@ -101,6 +101,11 @@ What these say:
 * 26.7 ms of *simulation* is far past a 16.6 ms frame budget on this adapter. None of that number
   applies to the 4060 Ti, which is the point of the caveat above.
 
+The 100k table predates the `density_ref` change from 12 to 30 (see `docs/math.md`). `integrate` is
+proportional to the neighbour count, so its 20.7 ms should be read as roughly 2.5x higher at the new
+density; the sort and grid passes are unchanged. That is the cost of keeping a 100k flock connected,
+and it needs re-measuring together with everything else on the target GPU.
+
 ## Known budget for the 50k-100k target
 
 From the plan, still to be validated on the target hardware. The measured column is the 100k row above,
@@ -113,16 +118,18 @@ for scale only:
 | hash + build_ranges + clear | ~1 ms | 0.36 ms |
 | agent rendering | ~2-3 ms | not measured (no present path) |
 | sky backdrop | <0.5 ms | not measured |
-| underwater raymarch | ? | not measured; heaviest render pass (up to 80 SDF steps/pixel) |
+| underwater raymarch | ? | not measured; heaviest render pass, now half-res (up to 80 SDF steps/pixel) |
 | bloom + composite | ~1-2 ms | not measured |
 
-The last two rows are built as of day 3. The post chain is fixed-cost and independent of the agent
+The last two rows are built as of day 4. The post chain is fixed-cost and independent of the agent
 count: six full-screen passes at half, quarter and eighth resolution (a bright pass, two downsamples,
 two additive upsamples, and the composite), plus one `Rgba16Float` scene target. The underwater
 raymarch is the one render pass whose cost scales with the *world*, not the swarm, because every pixel
-marches the reef field; `render/ocean.wgsl` is written so that the sample count and the step cap are
-the two levers, and half-resolution rendering of that pass alone is the documented fallback
-(`ADR-0005`). Both are waiting on the target machine, for the reason in the next section.
+marches the reef field. Since day 4 it runs at half resolution into its own target and a cheap
+full-screen resolve upsamples it and writes depth, which cuts its pixel cost fourfold; the remaining
+levers are the shaft sample count and the march step cap (`ADR-0005`). The render passes are still
+waiting on the target machine, for the reason in the next section. The render suite's own wall times
+are a rough signal: on the iGPU the fish checks roughly halved when the raymarch moved to half-res.
 
 ## Things that were measurably worth doing
 

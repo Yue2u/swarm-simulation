@@ -39,7 +39,11 @@ pub mod readback;
 pub mod renderer;
 pub mod scene;
 pub mod targets;
+pub mod terrain;
+pub mod tree;
 
 pub use renderer::{FrameInput, FrameStats, Renderer};
 pub use scene::{SceneBinding, SceneLayout};
+pub use terrain::TerrainPass;
+pub use tree::TreePass;
 pub use targets::{FrameTargets, DEPTH_FORMAT, HDR_FORMAT};

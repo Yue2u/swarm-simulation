@@ -51,6 +51,7 @@ fn integrate_agent(i: u32, acc: NeighbourAccum) {
         vel,
         params.env_id,
         params.env_scale,
+        params.env_freq,
         params.env_floor_y,
     );
     force = force + interaction_force(pos, vel, interaction);

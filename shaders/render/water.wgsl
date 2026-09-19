@@ -124,7 +124,7 @@ fn sun_visibility(p: vec3<f32>, sun: vec3<f32>, distance: f32) -> f32 {
     var vis = 1.0;
     for (var i = 1u; i <= 4u; i = i + 1u) {
         let q = p - sun * (distance * (f32(i) / 4.0));
-        vis = vis * smoothstep(0.0, 6.0, eval_field(q, ENV_REEF, water.reef_period, water.floor_y));
+        vis = vis * smoothstep(0.0, 6.0, eval_field(q, reef_args()));
     }
     return vis;
 }

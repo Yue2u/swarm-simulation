@@ -80,7 +80,7 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
     // The world is sized for a screenshot rather than for the app: the camera is placed relative to the
     // world, and a default world sized for 100k agents would put 2000 of them at a speck in the middle.
     let mut config = SimConfig::for_mode(request.mode, request.num_agents);
-    config.bounds_half = glam::Vec3::splat(config.r_percept * 9.0);
+    config.resize_world(glam::Vec3::splat(config.r_percept * 9.0));
 
     let swarm = boids_core::spawn::spawn_swarm(&config, request.seed);
     let mut sim = SimResources::new(&ctx, &config);
@@ -113,6 +113,7 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
     let mut renderer = Renderer::new(
         &ctx,
         [&sim.boids[0], &sim.boids[1]],
+        &config,
         wgpu::TextureFormat::Rgba8UnormSrgb,
         true,
         request.width,
@@ -138,7 +139,7 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
     #[allow(clippy::cast_precision_loss)]
     let (width_f, height_f) = (request.width as f32, request.height as f32);
     let camera = OrbitCamera {
-        target: glam::Vec3::ZERO,
+        target: config.spawn_center,
         distance: config.bounds_half.length() * request.camera_distance,
         pitch: request.camera_pitch,
         yaw: 0.7,
@@ -170,6 +171,7 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
             water: boids_scene::water_params(&config),
             interaction,
             post: boids_scene::post_params(config.mode, 0.0),
+            sky: boids_scene::sky_params(config.mode),
         },
     );
 

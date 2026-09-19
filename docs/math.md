@@ -45,16 +45,27 @@ undefined, and an agent with no neighbours has nothing to align with.
 
 ```
 density   = count * sep_boost          where sep_boost = 1 / density_ref
-w_sep_eff = w_sep * (1 + density)
-w_coh_eff = w_coh * exp(-density)
+push      = density ^ density_gain
+w_sep_eff = w_sep * push
+w_coh_eff = w_coh / push
 ```
 
-These two together are what prevent the classic boids failure mode, where cohesion wins inside a
-crowded core, the flock collapses to a point, and then separation throws it apart again in a cycle.
-Pushing apart faster than linearly while pulling together exponentially decays means the equilibrium
-density is stable rather than oscillating.
+The point of the form is where it is *neutral*: at `density == density_ref` the two multipliers are
+both 1, so a flock spawned at that density starts at equilibrium instead of being pre-loaded to
+explode. Below it, separation weakens and cohesion strengthens (the flock pulls together); above it,
+the reverse (it pushes apart). `density_gain == 0` disables the feedback and gives fixed weights;
+`density_gain == 1` is the proportional form above.
+
+The earlier pair, `w_sep * (1 + density)` and `w_coh * exp(-density)`, was already about ten times
+separation-dominant at `density_ref`, so a spawn there blew apart before cohesion could act. The
+`^ gain` form fixes that; `density_gain` is the single knob for how hard it swings.
 
 `sep_boost` is stored as a reciprocal because the shader multiplies by it once per agent per frame.
+
+The reference density is set by *connectivity*, not by taste. A flock is a random geometric graph on
+its perception edges, and such a graph is connected only while the average degree exceeds roughly
+`ln(n)`. At 100k agents `ln(n) ~ 11.5`, so the old `density_ref = 12` sat right at the threshold and
+the flock broke into micro-swarms; `density_ref = 30` carries a ~2.6x margin there.
 
 ## 4. Environment avoidance
 

@@ -1,21 +1,22 @@
 // === file: render/ocean.wgsl ================================================================
-// Pass: the underwater environment. One full-screen triangle, raymarched against the reef SDF.
+// Pass: the underwater environment. One full-screen triangle, raymarched against the reef SDF, at
+// half resolution. `render/ocean_resolve.wgsl` upsamples it and writes depth.
 //
 // bindings: @group(0) 0:SceneUniform(uniform) 1:array<Boid>(storage, read) 2:WaterParams(uniform)
 //                     3:InteractionUniforms(uniform) 4:PostParams(uniform)
 // draw:     draw(0..3, 0..1)
-// depth:    written per fragment from the hit distance; this pass runs *before* the agents, so their
-//           `LessEqual` test correctly rejects a fish that is behind a column and keeps one that is
-//           in front of the seafloor.
+// target:   half-size colour. The alpha channel carries the ray's hit distance in metres, or 0 for a
+//           miss, which is how the distance reaches the resolve without a depth texture the GL
+//           backend could not sample.
 //
 // WHY A RAYMARCH AND NOT GEOMETRY
 //   The reef is a domain-repeated family of tapered columns: unbounded, procedural, and cheap to
 //   evaluate but impossible to enumerate. Rasterising it would mean either generating distinct columns
 //   per world cell (which the domain repetition exists to avoid) or a voxel surface (which costs VRAM
 //   proportional to the world). Marching a distance field costs arithmetic per pixel and no memory,
-//   and it gives the depth buffer a real distance so the agents occlude against it correctly. That
-//   last point is the reason the pass is not simply a background gradient: the fish have to swim
-//   *behind* the columns, not be drawn over them.
+//   and it gives the resolve a real distance so the agents occlude against it correctly. That last
+//   point is the reason the pass is not simply a background gradient: the fish have to swim *behind*
+//   the columns, not be drawn over them.
 //
 // STEPPING RULE
 //   Sphere tracing with a 0.6 safety factor and a hard minimum step, not the textbook
@@ -26,8 +27,8 @@
 //   that rate still cover the whole world from any camera position inside it.
 //
 // INVARIANTS
-//   * `frag_depth` is written for every fragment; rays that hit nothing write 1.0, the far plane,
-//     because writing nothing would leave the previous frame's value in a caller-provided target.
+//   * the alpha channel is written for every fragment: the hit distance in metres, or 0 when the ray
+//     hit nothing, so a caller-provided target is never left with the previous frame's value.
 //   * colour is linear HDR: the surface is far above 1.0 and the bloom pass depends on that.
 
 //#include "render/water.wgsl"
@@ -37,6 +38,20 @@ const MARCH_STEPS: u32 = 80u;
 /// the whole world without hitting anything is looking at open water, and shading it as medium from
 /// here is indistinguishable from shading it after another thousand metres.
 const MARCH_RANGE: f32 = 3.0;
+
+/// The raymarch renders into a target this fraction of the scene's size per axis, so the ray for a
+/// fragment is reconstructed against the *scaled* viewport rather than the full one. Must match the
+/// half-size target the host allocates in `targets.rs`.
+const OCEAN_DOWNSCALE: f32 = 0.5;
+
+// NDC of the pixel `frag` is the centre of, for the half-size target.
+fn ocean_ndc(frag: vec4<f32>) -> vec2<f32> {
+    let viewport = scene.camera.viewport * OCEAN_DOWNSCALE;
+    return vec2<f32>(
+        2.0 * (frag.x) / viewport.x - 1.0,
+        1.0 - 2.0 * (frag.y) / viewport.y,
+    );
+}
 
 // What a ray hit.
 const KIND_NONE: u32 = 0u;
@@ -78,7 +93,7 @@ fn march(ro: vec3<f32>, rd: vec3<f32>, t_max: f32) -> MarchHit {
             break;
         }
         let p = ro + rd * t;
-        let d = eval_field(p, ENV_REEF, water.reef_period, water.floor_y);
+        let d = eval_field(p, reef_args());
         // Acceptance radius grows with distance: at 300 m a 2 cm threshold is below the precision of
         // an f32 position, and the march would never terminate on a surface it is grazing.
         if (d < max(0.02, 0.0025 * t)) {
@@ -124,7 +139,7 @@ fn shade_surface(ro: vec3<f32>, rd: vec3<f32>, t: f32, sun: vec3<f32>, time: f32
 fn shade_rock(ro: vec3<f32>, rd: vec3<f32>, t: f32, sun: vec3<f32>, time: f32) -> vec3<f32> {
     let p = ro + rd * t;
     let normal = safe_normalize(
-        sdf_gradient_at(p, 0.4, ENV_REEF, water.reef_period, water.floor_y),
+        sdf_gradient_at(p, 0.4, reef_args()),
     );
     let albedo = rock_albedo(p, normal);
 
@@ -159,15 +174,14 @@ fn shade_open_water(ro: vec3<f32>, rd: vec3<f32>, sun: vec3<f32>, time: f32) -> 
 }
 
 struct OceanOut {
+    // rgb is the shaded medium, a is the hit distance in metres or 0 for a miss. The resolve reads the
+    // distance back out of alpha and turns it into `frag_depth` at full resolution.
     @location(0) color: vec4<f32>,
-    // Written by hand: this pass is a full-screen triangle, so there is no rasterised geometry to
-    // produce a depth for it. Its real distance is what lets the agents depth-test against the reef.
-    @builtin(frag_depth) depth: f32,
 }
 
 @fragment
 fn fs_main(@builtin(position) frag: vec4<f32>) -> OceanOut {
-    let ndc = pixel_ndc(frag);
+    let ndc = ocean_ndc(frag);
     let rd = ray_from_clip(ndc);
     let ro = scene.camera.eye;
     let sun = safe_normalize(-scene.light_dir);
@@ -199,16 +213,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> OceanOut {
     // The marker is hidden by anything the ray hit first, which is what `hit.t` gives exactly.
     color = color + focus_marker(ro, rd, hit.t);
 
-    var depth = 1.0;
+    // The ray's metric distance, or 0 for a miss. `hit.t` is measured along the unit ray, so it is
+    // already metres from the eye; the resolve turns it into NDC depth at full resolution.
+    var distance = 0.0;
     if (hit.kind != KIND_NONE) {
-        let clip = clip_of(ro + rd * hit.t);
-        if (clip.w > 1e-6) {
-            depth = clamp(clip.z / clip.w, 0.0, 1.0);
-        }
+        distance = hit.t;
     }
 
     var out: OceanOut;
-    out.color = vec4<f32>(color, 1.0);
-    out.depth = depth;
+    out.color = vec4<f32>(color, distance);
     return out;
 }

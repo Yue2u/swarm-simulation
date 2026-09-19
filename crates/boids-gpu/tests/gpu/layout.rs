@@ -13,7 +13,7 @@
 
 use boids_core::layout::{
     Boid, CameraUniform, InteractionUniforms, MeshParams, PostParams, SceneUniform, SimParams,
-    WaterParams,
+    SkyParams, TerrainParams, TreeInstance, WaterParams,
 };
 use boids_gpu::context::GpuContext;
 use boids_gpu::transfer::read_buffer;
@@ -21,7 +21,7 @@ use boids_gpu::transfer::read_buffer;
 use crate::common::Check;
 
 /// Number of scalar slots the probe writes. Must match `PROBE_SLOTS` in the probe shader.
-const PROBE_SLOTS: usize = 88;
+const PROBE_SLOTS: usize = 120;
 
 /// Bytes of ramp written into each input buffer. Comfortably larger than every struct, and a multiple
 /// of 16 so the storage binding alignment rules are trivially satisfied.
@@ -68,7 +68,7 @@ fn expected_offsets() -> Vec<(usize, u32, Kind)> {
     triple!(out, 8, Boid, prev_dir, Kind::F32);
     scalar!(out, 11, Boid, color_seed, Kind::F32);
 
-    // SimParams, slots 12..45. Slots 45..48 are the explicit padding scalars, which the probe leaves
+    // SimParams, slots 12..46. Slots 46..48 are the explicit padding scalars, which the probe leaves
     // at -1 on purpose: padding has no defined value and asserting on it would be a lie.
     triple!(out, 12, SimParams, grid_min, Kind::F32);
     scalar!(out, 15, SimParams, cell_size, Kind::F32);
@@ -97,6 +97,7 @@ fn expected_offsets() -> Vec<(usize, u32, Kind)> {
     scalar!(out, 42, SimParams, env_scale, Kind::F32);
     scalar!(out, 43, SimParams, env_floor_y, Kind::F32);
     scalar!(out, 44, SimParams, env_id, Kind::U32);
+    scalar!(out, 45, SimParams, env_freq, Kind::F32);
 
     // InteractionUniforms, slots 48..60.
     triple!(out, 48, InteractionUniforms, ray_origin, Kind::F32);
@@ -138,6 +139,47 @@ fn expected_offsets() -> Vec<(usize, u32, Kind)> {
     scalar!(out, 82, PostParams, contrast, Kind::F32);
     scalar!(out, 83, PostParams, lift, Kind::F32);
 
+    // TerrainParams, slots 84..96. `min_xz`/`size_xz` are `[f32; 2]` on the Rust side and two
+    // scalars in WGSL, so they are expanded here to stay comparable slot for slot.
+    let min_xz = core::mem::offset_of!(TerrainParams, min_xz) as u32;
+    out.push((84, min_xz, Kind::F32));
+    out.push((85, min_xz + 4, Kind::F32));
+    let size_xz = core::mem::offset_of!(TerrainParams, size_xz) as u32;
+    out.push((86, size_xz, Kind::F32));
+    out.push((87, size_xz + 4, Kind::F32));
+    scalar!(out, 88, TerrainParams, amplitude, Kind::F32);
+    scalar!(out, 89, TerrainParams, frequency, Kind::F32);
+    scalar!(out, 90, TerrainParams, biome_frequency, Kind::F32);
+    scalar!(out, 91, TerrainParams, segments, Kind::U32);
+    scalar!(out, 92, TerrainParams, tree_height, Kind::F32);
+    scalar!(out, 93, TerrainParams, tree_capacity, Kind::U32);
+    scalar!(out, 94, TerrainParams, tree_candidates, Kind::U32);
+    scalar!(out, 95, TerrainParams, resolution, Kind::U32);
+
+    // SkyParams, slots 96..108. `beta_rayleigh`/`beta_mie` are `[f32; 3]` on the Rust side.
+    let beta_r = core::mem::offset_of!(SkyParams, beta_rayleigh) as u32;
+    out.push((96, beta_r, Kind::F32));
+    out.push((97, beta_r + 4, Kind::F32));
+    out.push((98, beta_r + 8, Kind::F32));
+    scalar!(out, 99, SkyParams, sun_intensity, Kind::F32);
+    let beta_m = core::mem::offset_of!(SkyParams, beta_mie) as u32;
+    out.push((100, beta_m, Kind::F32));
+    out.push((101, beta_m + 4, Kind::F32));
+    out.push((102, beta_m + 8, Kind::F32));
+    scalar!(out, 103, SkyParams, mie_g, Kind::F32);
+    scalar!(out, 104, SkyParams, ray_scale_height, Kind::F32);
+    scalar!(out, 105, SkyParams, mie_scale_height, Kind::F32);
+    scalar!(out, 106, SkyParams, horizon_boost, Kind::F32);
+    scalar!(out, 107, SkyParams, aerial_boost, Kind::F32);
+
+    // TreeInstance, slots 108..116.
+    triple!(out, 108, TreeInstance, pos, Kind::F32);
+    scalar!(out, 111, TreeInstance, scale, Kind::F32);
+    scalar!(out, 112, TreeInstance, yaw, Kind::F32);
+    scalar!(out, 113, TreeInstance, kind, Kind::F32);
+    scalar!(out, 114, TreeInstance, mask, Kind::F32);
+    scalar!(out, 115, TreeInstance, pad1, Kind::F32);
+
     out
 }
 
@@ -161,6 +203,9 @@ fn run_probe(ctx: &GpuContext) -> Vec<f32> {
     let interaction_in = make_input("probe interaction input");
     let water_in = make_input("probe water input");
     let post_in = make_input("probe post input");
+    let terrain_in = make_input("probe terrain input");
+    let sky_in = make_input("probe sky input");
+    let tree_in = make_input("probe tree input");
     let values_out = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("probe output"),
         size: (PROBE_SLOTS * 4) as u64,
@@ -168,9 +213,9 @@ fn run_probe(ctx: &GpuContext) -> Vec<f32> {
         mapped_at_creation: false,
     });
 
-    // Bindings 0..=5, with binding 3 the only read-write one: the inputs are read, the probe output
+    // Bindings 0..=8, with binding 3 the only read-write one: the inputs are read, the probe output
     // is written. `binding != 3` encodes exactly that.
-    let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..6)
+    let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..9)
         .map(|binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -206,6 +251,9 @@ fn run_probe(ctx: &GpuContext) -> Vec<f32> {
             bind(3, &values_out),
             bind(4, &water_in),
             bind(5, &post_in),
+            bind(6, &terrain_in),
+            bind(7, &sky_in),
+            bind(8, &tree_in),
         ],
     });
     let pipeline_layout = ctx
@@ -308,7 +356,7 @@ fn describe(v: f32) -> String {
 /// reported as a named check with the actual numbers, which is far more useful than a compile error
 /// pointing at a `const _` block.
 pub fn struct_sizes_are_exact(_ctx: &GpuContext) -> Check {
-    let table: [(&str, usize, usize, usize); 9] = [
+    let table: [(&str, usize, usize, usize); 12] = [
         ("Boid", core::mem::size_of::<Boid>(), core::mem::align_of::<Boid>(), 48),
         ("SimParams", core::mem::size_of::<SimParams>(), core::mem::align_of::<SimParams>(), 144),
         (
@@ -347,6 +395,24 @@ pub fn struct_sizes_are_exact(_ctx: &GpuContext) -> Check {
             core::mem::size_of::<PostParams>(),
             core::mem::align_of::<PostParams>(),
             48,
+        ),
+        (
+            "TerrainParams",
+            core::mem::size_of::<TerrainParams>(),
+            core::mem::align_of::<TerrainParams>(),
+            48,
+        ),
+        (
+            "SkyParams",
+            core::mem::size_of::<SkyParams>(),
+            core::mem::align_of::<SkyParams>(),
+            48,
+        ),
+        (
+            "TreeInstance",
+            core::mem::size_of::<TreeInstance>(),
+            core::mem::align_of::<TreeInstance>(),
+            32,
         ),
     ];
 

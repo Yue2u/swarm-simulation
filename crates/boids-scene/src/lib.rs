@@ -12,12 +12,19 @@
 //! * `boids-gpu` runs the simulation and knows nothing about water or palettes,
 //! * `boids-render` owns the passes, and asks this crate for the numbers they need.
 //!
-//! Today that is [`water`], the underwater medium and the post-processing grade. The sky world's
-//! terrain, biomes and palettes join it next.
+//! Today that is [`water`] (the underwater medium and the post-processing grade), [`sky`] (the
+//! atmosphere) and [`terrain`] (the sky world's ground, its baked heightfield and the meshes that go
+//! on it).
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations)]
 
+pub mod mesh;
+pub mod sky;
+pub mod terrain;
 pub mod water;
 
+pub use mesh::{tree_mesh, TreeMesh, TreeVertex};
+pub use sky::sky_params;
+pub use terrain::{map_resolution, mesh_segments, terrain_params, TerrainGpu};
 pub use water::{post_params, water_params};

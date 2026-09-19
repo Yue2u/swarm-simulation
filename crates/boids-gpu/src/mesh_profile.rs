@@ -10,10 +10,12 @@ use boids_core::layout::{MeshParams, SceneUniform, SimMode};
 ///
 /// This is the single number that decides whether a swarm reads as a flock or as a cloud. Too small and
 /// each agent is a sub-pixel speck that aliases into noise; too large and the agents merge into one
-/// solid mass with no visible individual motion. Roughly a quarter of the perception radius leaves
-/// several body lengths of clear space between neighbours at typical flock density, which is what makes
-/// both the individuals and the formation legible at once.
-const AGENT_SIZE_FRACTION: f32 = 0.25;
+/// solid mass with no visible individual motion.
+///
+/// It is tied to the reference density: the mean neighbour spacing scales as `density_ref^(-1/3)`, and
+/// the drawn size has to scale with it or a denser flock reads as a solid blob. `density_ref` went from
+/// 12 to 30 (see `docs/math.md`), a factor of `(12/30)^(1/3) ~ 0.74`, so the fraction does too.
+const AGENT_SIZE_FRACTION: f32 = 0.18;
 #[cfg(test)]
 use bytemuck::Zeroable;
 
@@ -58,7 +60,8 @@ pub fn mesh_profile(mode: SimMode, speed_ref: f32, perception_radius: f32) -> Me
             value: 0.9,
             speed_ref,
             scale,
-            _pad_a: 0.0,
+            // Underwater: the per-channel Beer-Lambert model in `render/water.wgsl`.
+            medium: 0.0,
             _pad_b: 0.0,
         },
         SimMode::Birds => MeshParams {
@@ -76,14 +79,17 @@ pub fn mesh_profile(mode: SimMode, speed_ref: f32, perception_radius: f32) -> Me
             wing_sweep: 0.55,
             emissive: 0.0,
             variant: 1.0,
-            // A wide hue range across warm colours, so a flock is visibly many species.
+            // A narrow warm band, and the *base* of it is shifted by the biome the flock is over
+            // (`boids_scene::sky`'s palette note): a wide range turns a flock into confetti, and no
+            // range at all turns it into a single flat colour.
             hue_base: 0.02,
-            hue_range: 0.45,
+            hue_range: 0.22,
             saturation: 0.8,
             value: 1.0,
             speed_ref,
             scale,
-            _pad_a: 0.0,
+            // Air: the single-coefficient aerial haze in `common/atmosphere.wgsl`.
+            medium: 1.0,
             _pad_b: 0.0,
         },
     }
@@ -104,7 +110,41 @@ pub fn scene_uniform(
     speed_ref: f32,
     perception_radius: f32,
 ) -> SceneUniform {
-    let (light_dir, ambient, fog_color, fog_density) = match mode {
+    build(camera, mesh_profile(mode, speed_ref, perception_radius), mode)
+}
+
+/// Builds the scene uniform for a frame part-way through the `from -> to` world morph.
+///
+/// The two worlds are the same pipeline with different numbers, so the transition is a blend of those
+/// numbers rather than a second code path: the mesh shape, its animation, its emission and its palette
+/// all lerp, and `MeshParams::variant` is the blend factor for the shader's continuous shape and
+/// animation branches (wing collapse, swim wave versus wing flap). `MeshParams::medium` is taken from
+/// the destination rather than blended, so the creature keeps the light it is actually flying through.
+/// The environment itself switches at the moment of the key press, because the two environments are
+/// different geometry on different scales, not two sets of numbers.
+#[allow(clippy::too_many_arguments)] // a transition is described by two worlds' worth of scalars
+#[must_use]
+pub fn scene_uniform_morph(
+    camera: boids_core::layout::CameraUniform,
+    from: SimMode,
+    to: SimMode,
+    t: f32,
+    from_speed: f32,
+    from_percept: f32,
+    to_speed: f32,
+    to_percept: f32,
+) -> SceneUniform {
+    let t = t.clamp(0.0, 1.0);
+    let a = mesh_profile(from, from_speed, from_percept);
+    let b = mesh_profile(to, to_speed, to_percept);
+    // The scene fields (light, haze) take the destination's values: they describe the air the camera
+    // is already in, and lerping them would only make the destination arrive out of focus.
+    build(camera, lerp_mesh(a, b, t), to)
+}
+
+/// One frame's scene fields for a world, as `(light_dir, ambient, fog_color, fog_density)`.
+fn scene_fields(mode: SimMode) -> ([f32; 3], f32, [f32; 3], f32) {
+    match mode {
         SimMode::Fish => (
             // Sunlight from above and slightly to one side, so the reef casts readable columns of
             // light and the fish are lit from above the way they would be underwater. The ambient
@@ -117,19 +157,64 @@ pub fn scene_uniform(
             0.022,
         ),
         SimMode::Birds => (
+            // A sun well above the horizon and off to one side: long enough shadows to read the
+            // terrain's relief, high enough that the light is not sunset-red.
             [0.4, -0.85, -0.3],
             0.32,
+            // Only the *haze* colour is used here now: the distance falloff is the atmosphere's
+            // (`aerial_perspective`), and this is the tint it leans toward away from the sun. Low
+            // density on purpose: the intended visibility is tens of kilometres, and the world is
+            // 1.5 km across.
             [0.45, 0.6, 0.78],
-            0.0012,
+            0.0006,
         ),
-    };
+    }
+}
+
+fn build(
+    camera: boids_core::layout::CameraUniform,
+    mesh: MeshParams,
+    mode: SimMode,
+) -> SceneUniform {
+    let (light_dir, ambient, fog_color, fog_density) = scene_fields(mode);
     SceneUniform {
         camera,
-        mesh: mesh_profile(mode, speed_ref, perception_radius),
+        mesh,
         light_dir,
         ambient,
         fog_color,
         fog_density,
+    }
+}
+
+/// Linear blend of two mesh profiles, field by field. `variant` carries `t` so the shader's shape and
+/// medium branches follow the same clock as the numbers.
+#[must_use]
+pub fn lerp_mesh(a: MeshParams, b: MeshParams, t: f32) -> MeshParams {
+    let mix = |x: f32, y: f32| x + (y - x) * t;
+    MeshParams {
+        body_w: mix(a.body_w, b.body_w),
+        body_h: mix(a.body_h, b.body_h),
+        nose: mix(a.nose, b.nose),
+        tail: mix(a.tail, b.tail),
+        fin_size: mix(a.fin_size, b.fin_size),
+        fin_z: mix(a.fin_z, b.fin_z),
+        wave_amp: mix(a.wave_amp, b.wave_amp),
+        wave_freq: mix(a.wave_freq, b.wave_freq),
+        wing_span: mix(a.wing_span, b.wing_span),
+        wing_sweep: mix(a.wing_sweep, b.wing_sweep),
+        emissive: mix(a.emissive, b.emissive),
+        variant: t,
+        hue_base: mix(a.hue_base, b.hue_base),
+        hue_range: mix(a.hue_range, b.hue_range),
+        saturation: mix(a.saturation, b.saturation),
+        value: mix(a.value, b.value),
+        speed_ref: mix(a.speed_ref, b.speed_ref),
+        scale: mix(a.scale, b.scale),
+        // The destination's medium, not a blend: during a morph the agents fly through the
+        // destination world's air or water, so `underwater`/`aerial` must be the destination's model.
+        medium: b.medium,
+        _pad_b: 0.0,
     }
 }
 
@@ -154,6 +239,9 @@ mod tests {
 
         assert_eq!(fish.variant, 0.0);
         assert_eq!(bird.variant, 1.0);
+        // And each profile names the medium its world's shader branch is.
+        assert_eq!(fish.medium, 0.0);
+        assert_eq!(bird.medium, 1.0);
     }
 
     #[test]
@@ -173,5 +261,32 @@ mod tests {
     fn profile_carries_the_speed_reference() {
         assert_eq!(mesh_profile(SimMode::Fish, 14.0, 3.5).speed_ref, 14.0);
         assert_eq!(mesh_profile(SimMode::Birds, 32.0, 14.0).speed_ref, 32.0);
+    }
+
+    /// The morph has to pass through the middle, with the variant as the clock the shader reads.
+    #[test]
+    fn morph_blends_between_the_profiles() {
+        let cam = boids_core::layout::CameraUniform::zeroed();
+        let fish = scene_uniform(cam, SimMode::Fish, 14.0, 3.5);
+        let bird = scene_uniform(cam, SimMode::Birds, 32.0, 14.0);
+
+        let mid = scene_uniform_morph(cam, SimMode::Fish, SimMode::Birds, 0.5, 14.0, 3.5, 32.0, 14.0);
+        assert!((mid.mesh.variant - 0.5).abs() < 1e-6);
+        assert!(
+            mid.mesh.wing_span > fish.mesh.wing_span && mid.mesh.wing_span < bird.mesh.wing_span,
+            "the wing should be half-grown at the midpoint"
+        );
+        assert!(mid.mesh.emissive < fish.mesh.emissive && mid.mesh.emissive > bird.mesh.emissive);
+        assert!(mid.mesh.speed_ref > fish.mesh.speed_ref && mid.mesh.speed_ref < bird.mesh.speed_ref);
+        // The medium is the destination's from the first frame, not blended.
+        assert_eq!(mid.mesh.medium, bird.mesh.medium);
+
+        // The endpoints are the profiles themselves, so a settled world does not pay for the morph.
+        let start = scene_uniform_morph(cam, SimMode::Fish, SimMode::Birds, 0.0, 14.0, 3.5, 32.0, 14.0);
+        assert_eq!(start.mesh.variant, 0.0);
+        assert_eq!(start.mesh.wing_span, fish.mesh.wing_span);
+        let end = scene_uniform_morph(cam, SimMode::Fish, SimMode::Birds, 1.0, 14.0, 3.5, 32.0, 14.0);
+        assert_eq!(end.mesh.variant, 1.0);
+        assert_eq!(end.mesh.wing_span, bird.mesh.wing_span);
     }
 }

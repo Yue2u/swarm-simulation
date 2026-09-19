@@ -36,9 +36,12 @@
 // exactly the kind of duplication this probe exists to avoid.
 @group(0) @binding(4) var<storage, read> water_in: WaterParams;
 @group(0) @binding(5) var<storage, read> post_in: PostParams;
+@group(0) @binding(6) var<storage, read> terrain_in: TerrainParams;
+@group(0) @binding(7) var<storage, read> sky_in: SkyParams;
+@group(0) @binding(8) var<storage, read> tree_in: TreeInstance;
 
 // Number of scalar slots the probe writes. Must match PROBE_SLOTS on the host.
-const PROBE_SLOTS: u32 = 88u;
+const PROBE_SLOTS: u32 = 120u;
 
 @compute @workgroup_size(1, 1, 1)
 fn probe(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -100,8 +103,9 @@ fn probe(@builtin(global_invocation_id) gid: vec3<u32>) {
     out[42] = p.env_scale;
     out[43] = p.env_floor_y;
     out[44] = f32(p.env_id);
-    // Slots 45..48 are the three explicit padding scalars of SimParams; they are reported as -1 and
-    // are deliberately not compared, because padding has no defined value.
+    out[45] = p.env_freq;
+    // Slots 46..48 are the two explicit padding scalars of SimParams; they are reported as -1 and are
+    // deliberately not compared, because padding has no defined value.
 
     // --- InteractionUniforms: 12 scalars, indices 48..60 ---
     let it = interaction_in;
@@ -147,6 +151,49 @@ fn probe(@builtin(global_invocation_id) gid: vec3<u32>) {
     out[81] = q.saturation;
     out[82] = q.contrast;
     out[83] = q.lift;
+
+    // --- TerrainParams: 12 scalars, indices 84..96 ---
+    let t = terrain_in;
+    out[84] = t.min_xz.x;
+    out[85] = t.min_xz.y;
+    out[86] = t.size_xz.x;
+    out[87] = t.size_xz.y;
+    out[88] = t.amplitude;
+    out[89] = t.frequency;
+    out[90] = t.biome_frequency;
+    out[91] = f32(t.segments);
+    out[92] = t.tree_height;
+    out[93] = f32(t.tree_capacity);
+    out[94] = f32(t.tree_candidates);
+    out[95] = f32(t.resolution);
+
+    // --- SkyParams: 12 scalars, indices 96..108 ---
+    let s = sky_in;
+    out[96] = s.beta_rayleigh.x;
+    out[97] = s.beta_rayleigh.y;
+    out[98] = s.beta_rayleigh.z;
+    out[99] = s.sun_intensity;
+    out[100] = s.beta_mie.x;
+    out[101] = s.beta_mie.y;
+    out[102] = s.beta_mie.z;
+    out[103] = s.mie_g;
+    out[104] = s.ray_scale_height;
+    out[105] = s.mie_scale_height;
+    out[106] = s.horizon_boost;
+    out[107] = s.aerial_boost;
+
+    // --- TreeInstance: 8 scalars, indices 108..116 ---
+    let tr = tree_in;
+    out[108] = tr.pos.x;
+    out[109] = tr.pos.y;
+    out[110] = tr.pos.z;
+    out[111] = tr.scale;
+    out[112] = tr.yaw;
+    out[113] = tr.kind;
+    out[114] = tr.mask;
+    out[115] = tr.pad1;
+    // Slots 116..120 are spare: the probe allocates a round number of slots so that adding a member
+    // to a struct does not silently overrun the array.
 
     for (var i = 0u; i < PROBE_SLOTS; i = i + 1u) {
         values_out[i] = out[i];

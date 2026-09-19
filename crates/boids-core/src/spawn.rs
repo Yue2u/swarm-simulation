@@ -19,10 +19,11 @@
 //! against, so the swarm starts exactly at the density where separation and cohesion balance, grows
 //! outward from there, and reaches the world's own density as a flock rather than as a spray.
 //!
-//! The ellipsoid's axes follow the world's own aspect ratio, and it is shrunk uniformly if it would
-//! not fit inside [`MAX_FILL_FRACTION`] of `bounds_half`. Both are structural rather than cosmetic: a
-//! sphere in a wide, shallow world would push its own edge through the soft boundary ramp within the
-//! first seconds, and the resulting "flocking" would actually be the boundary force.
+//! The ellipsoid's axes follow the world's own aspect ratio, then are clamped per axis to the space
+//! the cluster may use - the boundary ramp and, in the sky world, the air above the ridge line.
+//! Clamping per axis rather than uniformly is structural rather than cosmetic: the air above a
+//! mountain is shallow and wide, and a uniform shrink driven by the shallow axis would multiply the
+//! density in the other two, which is the difference between one flock and a knot.
 //!
 //! # Why a minimum separation
 //!
@@ -51,18 +52,26 @@ const MAX_FILL_FRACTION: f32 = 0.8;
 
 /// Candidate positions tried per agent before the minimum separation is abandoned.
 ///
-/// At the density the cluster is sized for, the exclusion volume is about 10% of the cluster's, so a
-/// single attempt succeeds almost always and this bound is never approached: it exists to make the
-/// routine's cost bounded rather than to be used.
-const SEPARATION_TRIES: usize = 24;
+/// At the reference density the exclusion volume (`density_ref * (r_sep / 2 / r_percept)^3`) is about
+/// 16% of the cluster's, so most attempts succeed on the first try. The bound is what keeps the
+/// routine linear, and it is large enough that the few near-saturated pockets late in the fill still
+/// find a gap rather than accepting an overlapping pair.
+const SEPARATION_TRIES: usize = 64;
 
 /// Semi-axes of the ellipsoid the swarm is spawned into.
 ///
 /// Sized so that an agent in the interior has about `density_ref` neighbours inside `r_percept`:
 /// with `volume = n * (4/3 pi r^3) / density_ref`, the density is exactly the reference density by
-/// construction. The shape is the world's aspect ratio scaled by a single factor, and that factor is
-/// reduced if the resulting ellipsoid would cross into the boundary ramp or leave the world, which
-/// makes the cluster tighter (and its neighbour count higher) rather than degenerate.
+/// construction. The shape is the world's aspect ratio scaled by a single factor, then clamped per
+/// axis to the boundary ramp.
+///
+/// The density is the thing that matters, and it must not be exceeded. `neighbour_force` scales the
+/// separation weight up and cohesion down as `n_local/density_ref` rises (`push = density^gain`), so
+/// a cluster spawned denser than the reference pushes itself apart faster than cohesion can hold it
+/// together, and the flock fragments. An earlier version also clamped the vertical axis to the air
+/// *above the terrain*, which over-compressed a 100k bird flock by 3.5x and did exactly that. The
+/// clamp is against the world box only, and the spawn centre is placed high enough in the box that
+/// the cluster is at the reference density and overlaps the ground rather than being squeezed.
 #[must_use]
 pub fn swarm_extent(config: &SimConfig) -> Vec3 {
     #[allow(clippy::cast_precision_loss)]
@@ -77,21 +86,29 @@ pub fn swarm_extent(config: &SimConfig) -> Vec3 {
     let unit_volume = 4.0 / 3.0 * core::f32::consts::PI * world.x * world.y * world.z;
     let scaled = world * (volume / unit_volume).cbrt();
 
-    // Uniform shrink, applied only when the cluster as a whole does not fit. Per-axis clamping would
-    // preserve the volume and distort the shape into a slab that no longer matches the world.
+    // Distance from the spawn centre to the boundary ramp on each axis. The box is symmetric about
+    // the origin, so subtracting the centre's magnitude gives the nearer wall on every axis.
     let limit = (world * MAX_FILL_FRACTION - config.spawn_center.abs()).max(Vec3::splat(1e-4));
-    let scale = (limit / scaled).min_element().min(1.0);
-    scaled * scale.max(1e-3)
+    scaled.min(limit).max(Vec3::splat(1e-4))
 }
 
-/// Places `config.num_boids` agents in one dense ellipsoid around `config.spawn_center`, with random
-/// directions, speeds near `max_speed` and no pair closer than `config.r_sep`.
+/// Shared heading the swarm spawns on.
+///
+/// Slightly up and across the world so the flock crosses the camera's view rather than flying
+/// straight away from it. Only its direction matters.
+const SPAWN_HEADING: Vec3 = Vec3::new(0.4, 0.15, 1.0);
+
+/// Places `config.num_boids` agents in one dense ellipsoid around `config.spawn_center`, on a shared
+/// heading (jittered by [`SimConfig::spawn_spread`]), with speeds near `max_speed` and no pair closer
+/// than `config.r_sep`.
 #[must_use]
 pub fn spawn_swarm(config: &SimConfig, seed: u64) -> Vec<Boid> {
     let mut rng = Pcg32::new(seed, 1);
     let axes = swarm_extent(config);
     let center = config.spawn_center;
     let min_distance = config.r_sep.max(1e-3);
+    let heading = SPAWN_HEADING.normalize();
+    let spread = config.spawn_spread.clamp(0.0, 1.0);
     let mut grid = SeparationGrid::new(min_distance);
 
     let mut out = Vec::with_capacity(config.num_boids);
@@ -99,11 +116,14 @@ pub fn spawn_swarm(config: &SimConfig, seed: u64) -> Vec<Boid> {
         // Drawn before the position so that the number of random values consumed per agent does not
         // depend on how many placement attempts it took. Deterministic either way, but a fixed
         // per-agent draw count makes a future per-agent field addition a local change.
-        let dir = rng.unit_vector();
+        let jitter = rng.unit_vector();
         let speed = rng.range(config.min_speed, config.max_speed);
         let phase = rng.range(0.0, core::f32::consts::TAU);
         let species = rng.next_f32();
         let color_seed = rng.next_f32();
+        // Blend the shared heading with the random draw: `spread == 0` is a perfectly coherent
+        // flock, `spread == 1` the fully random fill.
+        let dir = (heading * (1.0 - spread) + jitter * spread).normalize_or_zero();
 
         let mut placed = None;
         for _ in 0..SEPARATION_TRIES {
@@ -354,9 +374,19 @@ mod tests {
     }
 
     /// The point of the cluster: an agent must start with neighbours, not with an empty sphere.
+    ///
+    /// 100k as well as 20k because the two worlds are sized for the target count and the failure mode
+    /// this catches - a spawn cluster compressed by the world box until its density is a multiple of
+    /// the reference - only bites at the target count. At the reference density the adaptive weights
+    /// balance; above it, separation outruns cohesion and the flock fragments.
     #[test]
     fn spawn_forms_one_dense_swarm() {
-        for (mode, count) in [(SimMode::Fish, 20_000usize), (SimMode::Birds, 20_000)] {
+        for (mode, count) in [
+            (SimMode::Fish, 20_000usize),
+            (SimMode::Birds, 20_000),
+            (SimMode::Fish, 100_000),
+            (SimMode::Birds, 100_000),
+        ] {
             let cfg = SimConfig::for_mode(mode, count);
             let swarm = spawn_swarm(&cfg, 4);
             let counts = neighbours_within(&swarm, cfg.r_percept);
@@ -428,6 +458,87 @@ mod tests {
                 "extent shrank from {previous:?} to {axes:?} when the count grew"
             );
             previous = axes;
+        }
+    }
+
+    /// Connected components of the perception graph at `r_percept`, via a hash grid.
+    ///
+    /// O(N * degree) rather than O(N^2), which is what makes the 100k checks affordable.
+    fn graph_components(boids: &[Boid], radius: f32) -> usize {
+        let n = boids.len();
+        let cell = radius.max(1e-3);
+        let key = |p: Vec3| {
+            [
+                (p.x / cell).floor() as i32,
+                (p.y / cell).floor() as i32,
+                (p.z / cell).floor() as i32,
+            ]
+        };
+        let mut grid: HashMap<[i32; 3], Vec<u32>> = HashMap::new();
+        for (i, b) in boids.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            grid.entry(key(Vec3::from(b.pos))).or_default().push(i as u32);
+        }
+        let mut parent: Vec<u32> = (0..n as u32).collect();
+        fn root(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                parent[x as usize] = parent[parent[x as usize] as usize];
+                x = parent[x as usize];
+            }
+            x
+        }
+        let limit = radius * radius;
+        for (i, b) in boids.iter().enumerate() {
+            let p = Vec3::from(b.pos);
+            let base = key(p);
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let Some(bucket) =
+                            grid.get(&[base[0] + dx, base[1] + dy, base[2] + dz])
+                        else {
+                            continue;
+                        };
+                        for &j in bucket {
+                            if j as usize <= i {
+                                continue;
+                            }
+                            if (Vec3::from(boids[j as usize].pos) - p).length_squared() < limit {
+                                let (a, b) = (root(&mut parent, i as u32), root(&mut parent, j));
+                                if a != b {
+                                    parent[a as usize] = b;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        (0..n as u32).filter(|i| seen.insert(root(&mut parent, *i))).count()
+    }
+
+    /// At the target count the spawn's perception graph must be connected, not merely above the
+    /// random-geometric-graph threshold.
+    ///
+    /// This is the count-dependent failure the demo hit: the average perception degree of a 3D
+    /// flock is `density_ref`, and a random geometric graph is connected only while that degree
+    /// exceeds roughly `log n` - about 11.5 at 100k. The old `density_ref = 12` sat right at the
+    /// threshold, so any density dip shattered the flock into micro-swarms. This guards the margin.
+    #[test]
+    fn spawn_graph_is_connected_at_scale() {
+        for mode in [SimMode::Fish, SimMode::Birds] {
+            for seed in [4u64, 11] {
+                let cfg = SimConfig::for_mode(mode, 100_000);
+                let swarm = spawn_swarm(&cfg, seed);
+                let groups = graph_components(&swarm, cfg.r_percept);
+                assert_eq!(
+                    groups, 1,
+                    "{mode:?} seed {seed}: the 100k spawn has {groups} perception components; \
+                     density_ref={} is too close to the connectivity threshold",
+                    cfg.density_ref
+                );
+            }
         }
     }
 

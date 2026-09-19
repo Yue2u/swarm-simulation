@@ -66,7 +66,10 @@ struct SimParams {
     env_floor_y: f32,
     // 128
     env_id: u32,
-    pad0: f32,
+    // Terrain base noise frequency, m^-1. Unused by the reef, whose scale is `env_scale` (its
+    // repetition period). Lives here rather than in `TerrainParams` because the simulation's
+    // collision field needs it and the simulation never sees the render-side structs.
+    env_freq: f32,
     pad1: f32,
     pad2: f32,
     // 144 == size
@@ -139,7 +142,10 @@ struct MeshParams {
     // that an agent always occupies a similar share of the space it can see, which is what keeps the
     // swarm readable across both worlds and both scales.
     scale: f32,
-    pad_a: f32,
+    // Which medium attenuates the agent: 0 = the underwater per-channel model, 1 = the aerial haze.
+    // Set from the destination world during a morph so the creature keeps the light it is flying
+    // through; `variant` blends the body independently of this.
+    medium: f32,
     pad_b: f32,
     // 80 == size
 }
@@ -210,6 +216,112 @@ struct PostParams {
     contrast: f32,
     lift: f32,
     // 48 == size
+}
+
+// The sky world's land: the heightfield map, the mesh that draws it and the vegetation on it.
+//
+// One struct rather than three because the three consumers describe the same piece of ground: the
+// heightfield generator writes the map, the terrain mesh reads it back through the same
+// `amplitude`/`frequency` that the simulation's collision field uses, and the scatter pass places
+// trees on it. Splitting them would allow a mesh built from one amplitude and a collision field
+// built from another, which is exactly the class of bug the shared-field tests exist to prevent.
+//
+// Mirrors `TerrainParams` in `crates/boids-core/src/layout.rs`.
+struct TerrainParams {
+    // 0
+    // World xz of the map's minimum corner.
+    min_xz: vec2<f32>,
+    // 8
+    // World size the map covers, metres.
+    size_xz: vec2<f32>,
+    // 16
+    // Height scale, metres. Must equal the simulation's `env_scale` for the terrain field.
+    amplitude: f32,
+    // 20
+    // Base noise frequency, m^-1. Must equal the simulation's `env_freq`.
+    frequency: f32,
+    // 24
+    // Biome cell frequency, m^-1.
+    biome_frequency: f32,
+    // 28
+    // Mesh segments per axis. The grid has (segments + 1)^2 vertices and segments^2 * 2 triangles.
+    segments: u32,
+    // 32
+    // Height a drawn tree reaches above the ground, metres.
+    tree_height: f32,
+    // 36
+    // Instance slots in the tree buffer.
+    tree_capacity: u32,
+    // 40
+    // Scatter candidates per axis: capacity must be a small fraction of candidates^2.
+    tree_candidates: u32,
+    // 44
+    // Texels per axis of the baked map. Carried here rather than read with `textureDimensions`:
+    // the generating pass writes a *storage* texture, and asking a storage texture for its size
+    // needs the IMAGE_SIZE feature, which the GL adapter does not offer.
+    resolution: u32,
+    // 48 == size
+}
+
+// Analytic single-scattering atmosphere. Mirrors `SkyParams`, 48 bytes, twelve scalars.
+//
+// The coefficients are physical (metres^-1) rather than artistic, so the two numbers that matter to
+// the look are `sun_intensity` and `horizon_boost`. See `docs/math.md` for the integral this
+// approximates and why a single flat-atmosphere term is enough at this world's scale.
+struct SkyParams {
+    // 0
+    // Rayleigh scattering coefficient, m^-1: strong in blue, and the reason the sky is blue.
+    beta_rayleigh: vec3<f32>,
+    // 12
+    // Sun radiance scale. The only free knob in the model.
+    sun_intensity: f32,
+    // 16
+    // Mie scattering coefficient, m^-1: the aerosol term, nearly grey.
+    beta_mie: vec3<f32>,
+    // 28
+    // Henyey-Greenstein anisotropy of the Mie term. 0.76 is the usual forward-scattering haze.
+    mie_g: f32,
+    // 32
+    // Rayleigh scale height, metres.
+    ray_scale_height: f32,
+    // 36
+    // Mie scale height, metres.
+    mie_scale_height: f32,
+    // 40
+    // Extra brightness within a few degrees of the horizon, where the line of sight crosses the
+    // most air.
+    horizon_boost: f32,
+    // 44
+    // Multiplier on the in-scattered light that distant geometry fades into.
+    aerial_boost: f32,
+    // 48 == size
+}
+
+// One scattered tree. Storage buffer element, not a uniform: the scatter pass appends and the tree
+// pass draws `count` of them. Mirrors `TreeInstance` in `crates/boids-core/src/layout.rs`.
+//
+// 32 bytes so the array stride is a multiple of 16.
+struct TreeInstance {
+    // 0
+    // Base position (on the ground), metres.
+    pos: vec3<f32>,
+    // 12
+    // Uniform scale.
+    scale: f32,
+    // 16
+    // Rotation about Y, radians.
+    yaw: f32,
+    // 20
+    // Species/variant selector in [0, 1): picked from the scatter hash.
+    kind: f32,
+    // 24
+    // Biome mask under the trunk, in [0, 2). Stored rather than re-sampled by the draw pass: the
+    // scatter pass already had it in hand, and the tree pass would otherwise pay a texel load per
+    // vertex to learn what colour it is.
+    mask: f32,
+    // 28
+    pad1: f32,
+    // 32 == size
 }
 
 // Sentinel stored in `cell_start` for a cell that contains no boids.

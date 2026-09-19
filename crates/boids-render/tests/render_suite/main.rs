@@ -77,6 +77,7 @@ fn main() {
 
     let cases: Vec<NamedCheck> = vec![
         ("background_has_structure", background_has_structure),
+        ("terrain_grounds_the_sky_world", terrain_grounds_the_sky_world),
         ("agents_contribute_pixels", agents_contribute_pixels),
         ("depth_is_written", depth_is_written),
         ("worlds_look_different", worlds_look_different),
@@ -226,6 +227,7 @@ struct Harness<'a> {
     color: wgpu::Texture,
     depth: wgpu::Texture,
     water: WaterParams,
+    sky: boids_core::layout::SkyParams,
     post: PostParams,
     /// Cursor state for the next capture. Checks that do not care leave it idle.
     interaction: InteractionUniforms,
@@ -235,8 +237,10 @@ impl<'a> Harness<'a> {
     fn new(ctx: &'a GpuContext, mode: SimMode, agents: usize) -> Self {
         let mut config = SimConfig::for_mode(mode, agents);
         // Shrink the world so the agents are near the camera. The default world is sized for a hundred
-        // thousand agents and would leave a few thousand as an invisible speck.
-        config.bounds_half = Vec3::splat(config.r_percept * 8.0);
+        // thousand agents and would leave a few thousand as an invisible speck. `resize_world` and not
+        // a bare assignment: the terrain's amplitude, the seafloor and the spawn centre are all
+        // derived from the extent, and the app world's 110 m mountains in a 250 m box are a wall.
+        config.resize_world(Vec3::splat(config.r_percept * 8.0));
 
         let swarm = boids_core::spawn::spawn_swarm(&config, 4);
         let sim = SimResources::new(ctx, &config);
@@ -247,6 +251,7 @@ impl<'a> Harness<'a> {
         let renderer = Renderer::new(
             ctx,
             [&sim.boids[0], &sim.boids[1]],
+            &config,
             COLOR_FORMAT,
             true,
             WIDTH,
@@ -299,6 +304,7 @@ impl<'a> Harness<'a> {
             pipes,
             renderer,
             water: boids_scene::water_params(&config),
+            sky: boids_scene::sky_params(config.mode),
             post: boids_scene::post_params(config.mode, 0.5),
             interaction: SimConfig::idle_interaction(),
             config,
@@ -349,6 +355,7 @@ impl<'a> Harness<'a> {
                 water: self.water,
                 interaction: self.interaction,
                 post: self.post,
+                sky: self.sky,
             },
         );
 
@@ -525,6 +532,48 @@ fn background_has_structure(ctx: &GpuContext) -> CheckResult {
     Ok(Outcome::Pass)
 }
 
+/// The ground has to be a surface, not a net.
+///
+/// The grid's two triangles per quad must wind the same way; if the second is listed in the order
+/// that flips it, back-face culling removes exactly half the ground and the sky shows through the
+/// holes. The frame still has structure and still looks plausible at a glance, so this is checked by
+/// colour: the ground palettes (forest, dunes, canyon, rock) are all red-dominant or neutral, while
+/// the sky and its below-horizon haze are blue-dominant. Looking down, the bottom of the frame must
+/// be ground.
+fn terrain_grounds_the_sky_world(ctx: &GpuContext) -> CheckResult {
+    let mut harness = Harness::new(ctx, SimMode::Birds, 64);
+    harness.camera.pitch = 0.6;
+    let frame = harness.capture(0, 64);
+
+    let rows = 20.min(HEIGHT);
+    let mut sky_px = 0usize;
+    let mut total = 0usize;
+    for y in (HEIGHT - rows)..HEIGHT {
+        for x in 0..WIDTH {
+            let p = frame.pixel(x, y);
+            total += 1;
+            if i32::from(p[2]) > i32::from(p[0]) + 12 {
+                sky_px += 1;
+            }
+        }
+    }
+    let fraction = sky_px as f32 / total as f32;
+    if fraction > 0.25 {
+        return Err(format!(
+            "{:.0}% of the bottom {rows} rows are blue-dominant, so the sky is showing through the \
+             ground and the terrain mesh has holes. Check the winding in `quad_corner` in \
+             render/terrain.wgsl: half the grid triangles facing the wrong way are culled and leave \
+             a see-through net.",
+            fraction * 100.0
+        ));
+    }
+    println!(
+        "\n    ground covers the lower frame (sky through it {:.1}%)",
+        fraction * 100.0
+    );
+    Ok(Outcome::Pass)
+}
+
 fn agents_contribute_pixels(ctx: &GpuContext) -> CheckResult {
     let mut with = Harness::new(ctx, SimMode::Birds, 3000);
     let with_agents = with.capture(30, 3000);
@@ -578,12 +627,14 @@ fn depth_is_written(ctx: &GpuContext) -> CheckResult {
                 .to_string(),
         );
     }
-    // The background writes no depth, so anything past a modest fraction of the frame would mean the
-    // depth clear is not happening and the pass is testing against last frame's values.
-    if coverage > 0.9 {
+    // The terrain writes depth across the lower frame now, so a large coverage is expected; what must
+    // still be true is that the sky above it left the far plane clear, i.e. that the attachment was
+    // cleared rather than left holding last frame's values. A completely written frame would mean the
+    // clear is not happening.
+    if coverage > 0.999 {
         return Err(format!(
-            "{:.1}% of depth samples were written, which is far more than the swarm can cover. The \
-             depth attachment is probably not being cleared between frames.",
+            "{:.1}% of depth samples were written, leaving no sky at the far plane. The depth \
+             attachment is probably not being cleared between frames.",
             coverage * 100.0
         ));
     }

@@ -3,18 +3,23 @@
 //! # What one frame does
 //!
 //! ```text
-//! 1. uniforms   SceneUniform, WaterParams, InteractionUniforms, PostParams   (four write_buffer)
-//! 2. environment
-//!      underwater  render/ocean.wgsl       full-screen SDF raymarch, writes depth
-//!      sky         render/background.wgsl  full-screen gradient, no depth
-//! 3. agents     render/boid.wgsl           one instanced draw, depth tested and writing
-//! 4. bloom      bright, downsample, additive upsample into the pyramid
-//! 5. composite  aberration, exposure, ACES tone map, grade -> the target
+//! 1. uniforms   SceneUniform, WaterParams, InteractionUniforms, PostParams, SkyParams (five writes)
+//! 2. ocean      render/ocean.wgsl         underwater only: half-res SDF raymarch, alpha = hit metres
+//! 3. environment
+//!      underwater  render/ocean_resolve.wgsl  full-screen resolve, writes depth
+//!      sky         render/background.wgsl     full-screen atmosphere, no depth
+//! 4. ground     render/terrain.wgsl        sky world only: vertex-pulled grid, writes depth
+//! 5. trees      render/tree.wgsl           sky world only: one instanced indexed draw
+//! 6. agents     render/boid.wgsl           one instanced draw, depth tested and writing
+//! 7. bloom      bright, downsample, additive upsample into the pyramid
+//! 8. composite  aberration, exposure, ACES tone map, grade -> the target
 //! ```
 //!
-//! Steps 2 and 3 share one render pass and one depth attachment: the environment writes depth and the
-//! agents compare against it, which is what puts a fish behind a column and in front of the seafloor.
-//! Steps 4 and 5 are separate passes with no depth at all.
+//! Steps 3 to 6 share one render pass and one depth attachment: the resolve writes depth, the ground
+//! writes depth, and the agents compare against both, which is what puts a fish behind a column, a
+//! tree behind a ridge, and a bird in front of both. Step 2 is a pass of its own because its result
+//! has to be complete before the resolve samples it. Steps 7 and 8 are separate passes with no depth
+//! at all.
 //!
 //! # Why both worlds are built up front
 //!
@@ -24,9 +29,13 @@
 //! instead of a multi-second hitch. That is also why the post chain is shared rather than owned per
 //! world: the exposure differs, the chain does not.
 
-use boids_core::layout::{InteractionUniforms, PostParams, SceneUniform, WaterParams};
+use boids_core::config::SimConfig;
 use boids_core::layout::SimMode;
+use boids_core::layout::{
+    InteractionUniforms, PostParams, SceneUniform, SkyParams, WaterParams,
+};
 use boids_gpu::context::GpuContext;
+use boids_scene::TerrainGpu;
 
 use crate::background::BackgroundPass;
 use crate::boid_pass::BoidPass;
@@ -34,6 +43,8 @@ use crate::ocean::OceanPass;
 use crate::post::PostChain;
 use crate::scene::{SceneBinding, SceneLayout};
 use crate::targets::FrameTargets;
+use crate::terrain::TerrainPass;
+use crate::tree::TreePass;
 
 /// What the renderer needs to know about this frame that is not in the scene uniform.
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +61,8 @@ pub struct FrameInput {
     pub interaction: InteractionUniforms,
     /// Post-processing parameters.
     pub post: PostParams,
+    /// Atmospheric scattering parameters.
+    pub sky: SkyParams,
 }
 
 /// Draw calls, instances and triangles recorded for one frame.
@@ -70,8 +83,13 @@ pub struct Renderer {
     scene: SceneLayout,
     background: BackgroundPass,
     ocean: OceanPass,
+    terrain: TerrainPass,
+    trees: TreePass,
     boids: BoidPass,
     post: PostChain,
+    /// The baked ground and its scattered trees, borrowed by the scene bind groups. Kept here so
+    /// that its buffers outlive them, and so the frame graph can ask how many trees to draw.
+    terrain_data: TerrainGpu,
     format: wgpu::TextureFormat,
     is_srgb: bool,
     last_size: (u32, u32),
@@ -86,17 +104,32 @@ impl Renderer {
     pub fn new(
         ctx: &GpuContext,
         boids: [&wgpu::Buffer; 2],
+        config: &SimConfig,
         format: wgpu::TextureFormat,
         is_srgb: bool,
         width: u32,
         height: u32,
     ) -> Self {
-        let scene = SceneLayout::new(ctx, boids);
+        // The ground belongs to the sky world, but both worlds are built at startup so TAB can
+        // switch without reallocating. Even a renderer started in the underwater world bakes the sky
+        // world's terrain: building it from the *active* config would give the fish world's shrunken,
+        // reef-scaled parameters a map a fraction of the area the birds fly in, so switching to birds
+        // would show a small island under a swarm spread across empty space. The underwater shaders
+        // never sample the heightfield or the trees, so the binding is simply inert there.
+        let terrain_config = match config.mode {
+            SimMode::Birds => config.clone(),
+            SimMode::Fish => SimConfig::for_mode(SimMode::Birds, config.num_boids),
+        };
+        let terrain_data = TerrainGpu::new(&ctx.device, &ctx.queue, &terrain_config);
+        let sky = boids_scene::sky_params(config.mode);
+        let scene = SceneLayout::new(ctx, boids, &terrain_data, &sky);
         let targets = FrameTargets::new(&ctx.device, width, height);
         // The sky backdrop needs the format of the *scene* target now, not the swapchain: it draws
         // into the HDR intermediate like everything else, and the composite owns the swapchain.
         let background = BackgroundPass::new(ctx, &scene);
-        let ocean = OceanPass::new(ctx, &scene);
+        let ocean = OceanPass::new(ctx, &scene, &targets);
+        let terrain = TerrainPass::new(ctx, &scene, &terrain_config);
+        let trees = TreePass::new(ctx, &scene);
         let boids_pass = BoidPass::new(ctx, &scene);
         let post = PostChain::new(
             ctx,
@@ -108,18 +141,25 @@ impl Renderer {
             height,
         );
         log::info!(
-            "renderer: {}x{} swapchain {format:?} (srgb {is_srgb}), bloom {:?}",
+            "renderer: {}x{} swapchain {format:?} (srgb {is_srgb}), bloom {:?}, terrain {} tris, \
+             {} trees of {} tris",
             width.max(1),
             height.max(1),
-            post.bloom_size()
+            post.bloom_size(),
+            terrain.triangles(),
+            terrain_data.tree_count(),
+            trees.triangles_per_tree(),
         );
         Self {
             targets,
             scene,
             background,
             ocean,
+            terrain,
+            trees,
             boids: boids_pass,
             post,
+            terrain_data,
             format,
             is_srgb,
             last_size: (width.max(1), height.max(1)),
@@ -150,6 +190,8 @@ impl Renderer {
                 self.targets.size.0,
                 self.targets.size.1
             );
+            // The ocean resolve samples the half-size target, which is a new texture now.
+            self.ocean.resize(ctx, &self.targets);
         }
         // The post chain is rebuilt whenever the size *or* the HDR view changed, which the chain
         // decides for itself by comparing sizes; after a resize both have.
@@ -202,6 +244,7 @@ impl Renderer {
             &input.water,
             &input.interaction,
             &input.post,
+            &input.sky,
         );
 
         let mut encoder = ctx
@@ -211,6 +254,33 @@ impl Renderer {
             });
 
         let mut stats = FrameStats::default();
+
+        // 0. Underwater environment, at half resolution. A pass of its own so that the resolve below
+        //    can sample its output; `wgpu` inserts the barrier between passes. The sky backdrop fills
+        //    its own pixels and needs no pre-pass.
+        if input.world == SimMode::Fish {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ocean raymarch"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.targets.ocean_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                // No depth: the raymarch's distance reaches the agents through the colour target's
+                // alpha channel and the resolve, not through a depth attachment (see `ocean.rs`).
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.ocean.draw_raymarch(&mut pass, &self.scene, input.binding);
+            stats.draw_calls += 1;
+        }
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
@@ -231,7 +301,7 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations {
                         // Cleared to 1.0, the far plane, because the agents use `LessEqual`: anything
                         // an agent writes must be closer than the clear value or it would be rejected.
-                        // The ocean pass then overwrites this with its real hit distances, and the
+                        // The ocean resolve then overwrites this with its real hit distances, and the
                         // agents are rejected behind rock exactly as they are behind each other.
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -243,15 +313,33 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            // 1. Environment. One of the two backdrops; only the underwater one writes depth.
+            // 1. Environment. The underwater world resolves the half-size raymarch into this
+            //    full-size pass and writes its depth; the sky backdrop fills every pixel and leaves
+            //    the far plane clear.
             match input.world {
-                SimMode::Fish => self.ocean.draw(&mut pass, &self.scene, input.binding),
+                SimMode::Fish => self.ocean.draw_resolve(&mut pass, &self.scene, input.binding),
                 SimMode::Birds => self.background.draw(&mut pass, &self.scene, input.binding),
             }
             stats.draw_calls += 1;
 
-            // 2. Agents: one instanced draw for the whole swarm, depth tested against whatever the
-            //    environment wrote.
+            // 2. Ground and trees: the sky world's own geometry. Both write depth, and both are
+            //    drawn before the agents so a bird is occluded by the ridge it flies behind.
+            if input.world == SimMode::Birds {
+                self.terrain.draw(&mut pass, &self.scene, input.binding);
+                stats.draw_calls += 1;
+                stats.triangles += u64::from(self.terrain.triangles());
+
+                let trees = self.terrain_data.tree_count();
+                self.trees.draw(&mut pass, &self.scene, input.binding, trees);
+                if trees > 0 {
+                    stats.draw_calls += 1;
+                    stats.instances += u64::from(trees);
+                    stats.triangles += u64::from(trees) * u64::from(self.trees.triangles_per_tree());
+                }
+            }
+
+            // 3. Agents: one instanced draw for the whole swarm, depth tested against whatever the
+            //    environment and the ground wrote.
             self.boids
                 .draw(&mut pass, &self.scene, input.binding, input.num_agents);
             if input.num_agents > 0 {
