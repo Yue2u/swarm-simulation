@@ -3,9 +3,10 @@
 //
 // bindings: @group(0) 0:SceneUniform(uniform) 1:array<Boid>(storage, read) 2:WaterParams(uniform)
 //                     3:InteractionUniforms(uniform) 4:PostParams(uniform) 5:TerrainParams(uniform)
-//                     6:heightfield(texture_2d<f32>, read) 7:array<TreeInstance>(storage, read)
+//                     6:heightfield(texture_2d<f32>, read) 7:array<StaticInstance>(storage, read)
 //                     8:SkyParams(uniform)
-// buffers:  @location(0) position: vec3<f32>  @location(1) normal: vec3<f32>   (the tree mesh)
+// buffers:  @location(0) position: vec3<f32>  @location(1) normal: vec3<f32>
+//           @location(2) material: f32    (unused here: a tree's two materials are its normals)
 // draw:     draw_indexed(0..index_count, 0..tree_count)
 // cull:     back faces. The mesh is closed enough for it, and a forest is the one place in the frame
 //           where the fill rate is worth spending a cull on.
@@ -51,6 +52,10 @@ fn tree_tint(kind: f32, mask: f32, normal_y: f32) -> vec3<f32> {
 fn vs_main(
     @location(0) local_pos: vec3<f32>,
     @location(1) local_normal: vec3<f32>,
+    // The static mesh vertex carries a material selector for the castle, which has several materials
+    // that its normals cannot separate. A tree's two are its normals, so this is ignored rather than
+    // branched on: declaring it keeps the vertex layout shared.
+    @location(2) _material: f32,
     @builtin(instance_index) inst: u32,
 ) -> VsOut {
     let tree = trees[inst];

@@ -54,8 +54,18 @@ pub struct InputState {
     pub quit: bool,
     /// Set when the user asked to switch worlds.
     pub toggle_world: bool,
-    /// Set when the user asked to reset the swarm.
+    /// Set when the user asked to reset the swarm, or to reframe the model viewer.
     pub reset: bool,
+    /// Set when the user asked to open or close the model viewer.
+    pub toggle_viewer: bool,
+    /// Models to step the viewer by, negative for the previous one. Accumulates like the others.
+    pub model_step: i32,
+    /// A model selected by number key, as an index into `Model::ALL`.
+    ///
+    /// The number keys already mean "cursor mode" outside the viewer, so they carry both meanings and
+    /// the app picks the one that applies to the mode it is in. That keeps the input state ignorant of
+    /// the viewer, which is the app's business.
+    pub model_select: Option<usize>,
 }
 
 impl Default for InputState {
@@ -71,6 +81,9 @@ impl Default for InputState {
             quit: false,
             toggle_world: false,
             reset: false,
+            toggle_viewer: false,
+            model_step: 0,
+            model_select: None,
         }
     }
 }
@@ -126,15 +139,22 @@ impl InputState {
                 "1" => {
                     self.mode = InteractionMode::Attract;
                     self.active = true;
+                    self.model_select = Some(0);
                 }
                 "2" => {
                     self.mode = InteractionMode::Repel;
                     self.active = true;
+                    self.model_select = Some(1);
                 }
+                "3" => self.model_select = Some(2),
+                "4" => self.model_select = Some(3),
                 "0" => {
                     self.mode = InteractionMode::Off;
                     self.active = false;
                 }
+                "v" | "V" => self.toggle_viewer = true,
+                "[" => self.model_step -= 1,
+                "]" => self.model_step += 1,
                 "r" | "R" => self.reset = true,
                 _ => {}
             },
@@ -183,6 +203,9 @@ impl InputState {
             toggle_world: std::mem::take(&mut self.toggle_world),
             reset: std::mem::take(&mut self.reset),
             quit: std::mem::take(&mut self.quit),
+            toggle_viewer: std::mem::take(&mut self.toggle_viewer),
+            model_step: std::mem::take(&mut self.model_step),
+            model_select: self.model_select.take(),
         };
 
         match self.drag {
@@ -211,10 +234,16 @@ impl InputState {
 pub struct FrameActions {
     /// Switch between the underwater and sky worlds.
     pub toggle_world: bool,
-    /// Respawn the swarm.
+    /// Respawn the swarm, or reframe the model viewer.
     pub reset: bool,
     /// Exit.
     pub quit: bool,
+    /// Open or close the model viewer.
+    pub toggle_viewer: bool,
+    /// Step the model viewer's selection, negative for the previous model.
+    pub model_step: i32,
+    /// A model selected by number key, as an index into `Model::ALL`.
+    pub model_select: Option<usize>,
 }
 
 #[cfg(test)]
@@ -231,7 +260,10 @@ mod tests {
         assert!(input.interaction_enabled(), "default mode is attract");
 
         input.on_key(&Key::Character("0".into()), false);
-        assert!(!input.interaction_enabled(), "mode 0 must disable influence");
+        assert!(
+            !input.interaction_enabled(),
+            "mode 0 must disable influence"
+        );
 
         input.on_key(&Key::Character("2".into()), false);
         assert_eq!(input.mode, InteractionMode::Repel);
@@ -262,7 +294,11 @@ mod tests {
         input.drag = Drag::Orbit;
 
         input.on_cursor_move(Vec2::new(500.0, 400.0));
-        assert_eq!(input.motion, Vec2::ZERO, "the first sample is a baseline, not motion");
+        assert_eq!(
+            input.motion,
+            Vec2::ZERO,
+            "the first sample is a baseline, not motion"
+        );
         let yaw = camera.yaw;
         input.consume(&mut camera);
         assert_eq!(camera.yaw, yaw, "no motion means no rotation");
@@ -284,17 +320,30 @@ mod tests {
         for step in 1..=3 {
             input.on_cursor_move(Vec2::new(100.0 + 20.0 * step as f32, 100.0));
         }
-        assert_eq!(input.motion.x, 60.0, "three 20-pixel steps should accumulate");
+        assert_eq!(
+            input.motion.x, 60.0,
+            "three 20-pixel steps should accumulate"
+        );
 
         let yaw_before = camera.yaw;
         input.consume(&mut camera);
-        assert_ne!(camera.yaw, yaw_before, "the orbit drag should have rotated the camera");
-        assert_eq!(input.motion, Vec2::ZERO, "motion must be cleared after consumption");
+        assert_ne!(
+            camera.yaw, yaw_before,
+            "the orbit drag should have rotated the camera"
+        );
+        assert_eq!(
+            input.motion,
+            Vec2::ZERO,
+            "motion must be cleared after consumption"
+        );
 
         // A second consume with no new events must not move the camera again.
         let yaw_after = camera.yaw;
         input.consume(&mut camera);
-        assert_eq!(camera.yaw, yaw_after, "a drained input must not be applied twice");
+        assert_eq!(
+            camera.yaw, yaw_after,
+            "a drained input must not be applied twice"
+        );
     }
 
     #[test]

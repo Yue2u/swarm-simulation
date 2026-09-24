@@ -20,7 +20,7 @@ use boids_gpu::context::{GpuContext, GpuContextDescriptor, SurfaceState};
 use boids_gpu::profile::{GpuProfiler, MAX_TIMED_PASSES};
 use boids_gpu::sim::{SimPipelines, SimResources, Strategy};
 use boids_render::renderer::{FrameInput, Renderer};
-use boids_render::SceneBinding;
+use boids_render::{Model, SceneBinding};
 use glam::Vec2;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -57,6 +57,8 @@ pub struct StartupConfig {
     /// swarm, without editing code: `Strategy::for_count` is only faster, never more correct, and a
     /// measurement that cannot hold everything but the strategy constant is not a measurement.
     pub strategy: Option<Strategy>,
+    /// Open the model viewer on this mesh instead of the swarm.
+    pub viewer: Option<Model>,
 }
 
 impl Default for StartupConfig {
@@ -71,6 +73,7 @@ impl Default for StartupConfig {
             deterministic: false,
             profile: false,
             strategy: None,
+            viewer: None,
         }
     }
 }
@@ -94,6 +97,31 @@ const INTERACTION_PLANE_FRACTION: f32 = 0.6;
 /// bird are the same pipeline with a different set of numbers, and `render/boid.wgsl` blends those
 /// numbers rather than branching on them.
 const MORPH_SECONDS: f32 = 1.5;
+
+/// Field of view of the model viewer, radians.
+///
+/// Narrower than the scene's 55 degrees: the studio frames one object about a unit across, and a wide
+/// lens on a small object is all perspective distortion.
+const VIEWER_FOV: f32 = 45f32.to_radians();
+
+/// The camera the model viewer orbits its mesh with.
+///
+/// Framed by the model (`Model::target`, `Model::distance`, `Model::pitch`) so that a bird with a
+/// three-unit wingspan and a one-unit castle both fill the frame. `r` returns it to this framing.
+fn frame_model(model: Model) -> OrbitCamera {
+    OrbitCamera {
+        target: model.target(),
+        distance: model.distance(),
+        yaw: 0.6,
+        pitch: model.pitch(),
+        fov_y: VIEWER_FOV,
+        // Close, because a model is about a unit across: the scene's 0.5 near plane would put the
+        // camera inside the mesh it is framing.
+        near: 0.02,
+        far: 100.0,
+        aspect: 16.0 / 9.0,
+    }
+}
 
 /// A world switch in progress.
 #[derive(Debug, Clone, Copy)]
@@ -145,6 +173,17 @@ pub struct BoidsApp {
     morph: Option<WorldMorph>,
     /// Per-pass GPU timing, when started with `--profile`.
     profiler: Option<GpuProfiler>,
+    /// The mesh the model viewer is showing, or `None` when the swarm is being drawn.
+    viewer: Option<Model>,
+    /// The viewer's own camera, so opening and closing it does not disturb the scene's framing.
+    viewer_camera: OrbitCamera,
+    /// Time the viewer animates with, in seconds. Separate from `sim_time`, which only advances while
+    /// the swarm is stepping: the viewer is not showing the swarm, and a paused simulation should not
+    /// freeze a fish's tail.
+    viewer_time: f32,
+    /// The mesh the viewer will show, remembered across openings so that closing it and pressing `v`
+    /// again returns to the same model rather than to the first one.
+    viewer_model: Model,
 }
 
 impl core::fmt::Debug for BoidsApp {
@@ -167,6 +206,8 @@ impl BoidsApp {
             SimMode::Fish
         };
         let sim_config = SimConfig::for_mode(mode, startup.num_agents);
+        let startup_viewer = startup.viewer;
+        let viewer_camera = startup_viewer.map_or_else(OrbitCamera::default, frame_model);
         let camera = OrbitCamera {
             // The orbit target is the swarm's spawn centre rather than the world's origin: in the sky
             // world the ground rises above y = 0, so a camera aimed at the origin would look at a
@@ -191,6 +232,10 @@ impl BoidsApp {
             frames: 0,
             morph: None,
             profiler: None,
+            viewer: startup_viewer,
+            viewer_camera,
+            viewer_time: 0.0,
+            viewer_model: startup_viewer.unwrap_or_default(),
         }
     }
 
@@ -382,9 +427,13 @@ impl BoidsApp {
         self.morph = Some(WorldMorph {
             from: self.morph.map_or(from, |m| m.from),
             to,
-            from_speed: self.morph.map_or(self.sim_config.max_speed, |m| m.from_speed),
+            from_speed: self
+                .morph
+                .map_or(self.sim_config.max_speed, |m| m.from_speed),
             to_speed: next.max_speed,
-            from_percept: self.morph.map_or(self.sim_config.r_percept, |m| m.from_percept),
+            from_percept: self
+                .morph
+                .map_or(self.sim_config.r_percept, |m| m.from_percept),
             to_percept: next.r_percept,
             t: 0.0,
         });
@@ -524,6 +573,57 @@ impl BoidsApp {
         );
     }
 
+    /// Switches the mesh the viewer shows, and reframes the camera for it.
+    fn select_model(&mut self, model: Model) {
+        if model == self.viewer_model {
+            return;
+        }
+        self.viewer_model = model;
+        self.viewer_camera = frame_model(model);
+        log::info!("model viewer: {}", model.label());
+    }
+
+    /// Records and presents one frame of the model viewer.
+    ///
+    /// The viewer's own frame shape: no simulation step, no scene pass, one mesh in a studio. The
+    /// camera is the viewer's own, so opening and closing the viewer leaves the scene's framing where
+    /// the user left it.
+    fn render_viewer(&mut self) {
+        let Some(gpu) = &self.gpu else { return };
+        let Some(surface) = &self.surface else { return };
+
+        let (width, height) = surface.size();
+        self.viewer_camera.set_viewport(width, height);
+        let model = self.viewer_model;
+        let time = self.viewer_time;
+
+        let Some(surface) = &mut self.surface else {
+            return;
+        };
+        let Some(frame) = surface.acquire(gpu, width, height) else {
+            return;
+        };
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        renderer.resize(gpu, width, height);
+
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let stats = renderer.render_model(gpu, &view, model, &self.viewer_camera, time);
+
+        gpu.queue.present(frame);
+        self.frames += 1;
+        log::trace!(
+            "frame {}: model {} ({} draw, {} triangles)",
+            self.frames,
+            model.label(),
+            stats.draw_calls,
+            stats.triangles
+        );
+    }
+
     /// Updates the window title with the frame rate and the current world.
     ///
     /// Also prints a periodic line to the log. A title bar is unreadable over a remote session and
@@ -562,13 +662,17 @@ impl BoidsApp {
         } else {
             0.0
         };
+        let subject = match self.viewer {
+            Some(model) => format!("model: {}", model.label()),
+            None => match self.sim_config.mode {
+                SimMode::Fish => "underwater".to_string(),
+                SimMode::Birds => "sky".to_string(),
+            },
+        };
         window.set_title(&format!(
             "boids | {} agents | {} | {:.0} fps | {:.1} ms | {}",
             self.sim_config.num_boids,
-            match self.sim_config.mode {
-                SimMode::Fish => "underwater",
-                SimMode::Birds => "sky",
-            },
+            subject,
             fps,
             self.smoothed_frame_time * 1000.0,
             match self.input.mode {
@@ -634,11 +738,40 @@ impl ApplicationHandler for BoidsApp {
             event_loop.exit();
             return;
         }
-        if actions.toggle_world {
+        if actions.toggle_viewer {
+            self.viewer = match self.viewer {
+                Some(_) => None,
+                None => Some(self.viewer_model),
+            };
+            // Opening reframes, so a model left at an angle by a previous visit is shown whole.
+            if self.viewer.is_some() {
+                self.viewer_camera = frame_model(self.viewer_model);
+                log::info!("model viewer: {}", self.viewer_model.label());
+            } else {
+                log::info!("model viewer closed");
+            }
+        }
+        if self.viewer.is_some() {
+            // The number keys and the brackets are the viewer's model selection. They are read only
+            // here, so the same keys keep meaning "cursor mode" while the swarm is on screen.
+            if let Some(index) = actions.model_select {
+                self.select_model(Model::ALL[index.min(Model::ALL.len() - 1)]);
+            }
+            if actions.model_step > 0 {
+                self.select_model(self.viewer_model.next());
+            } else if actions.model_step < 0 {
+                self.select_model(self.viewer_model.previous());
+            }
+        }
+        if actions.toggle_world && self.viewer.is_none() {
             self.toggle_world();
         }
         if actions.reset {
-            self.respawn();
+            if self.viewer.is_some() {
+                self.viewer_camera = frame_model(self.viewer_model);
+            } else {
+                self.respawn();
+            }
         }
     }
 
@@ -676,10 +809,18 @@ impl BoidsApp {
             }
         }
 
-        if !self.input.paused {
-            self.step_simulation(dt);
+        if self.viewer.is_some() {
+            // The swarm is not advanced while the viewer is open. It is not on screen, and a
+            // simulation running behind an inspection view is state nobody can see. The viewer's own
+            // clock advances so that a fish keeps swimming and a bird keeps flapping.
+            self.viewer_time += dt;
+            self.render_viewer();
+        } else {
+            if !self.input.paused {
+                self.step_simulation(dt);
+            }
+            self.render_frame();
         }
-        self.render_frame();
         self.update_title();
     }
 }

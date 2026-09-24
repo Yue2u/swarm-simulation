@@ -2,7 +2,7 @@
 // Pass: places the trees of the sky world on the terrain. One dispatch at startup.
 //
 // bindings: @group(0) 0:TerrainParams(uniform) 1:heightfield(texture_2d<f32>, read)
-//                     2:trees(storage, read_write array<TreeInstance>)
+//                     2:trees(storage, read_write array<StaticInstance>)
 //                     3:counters(storage, read_write Counters)
 // workgroup: 64 x 1 x 1
 // dispatch:  ceil(candidates^2 / 64)
@@ -30,7 +30,7 @@
 
 @group(0) @binding(0) var<uniform> terrain: TerrainParams;
 @group(0) @binding(1) var heightfield: texture_2d<f32>;
-@group(0) @binding(2) var<storage, read_write> trees: array<TreeInstance>;
+@group(0) @binding(2) var<storage, read_write> trees: array<StaticInstance>;
 @group(0) @binding(3) var<storage, read_write> counters: Counters;
 
 struct Counters {
@@ -90,7 +90,7 @@ fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    var tree: TreeInstance;
+    var tree: StaticInstance;
     tree.pos = vec3<f32>(world.x, sample.height, world.y);
     tree.scale = terrain.tree_height * (0.72 + 0.65 * scatter_hash(i, 4u));
     tree.yaw = scatter_hash(i, 5u) * TAU;

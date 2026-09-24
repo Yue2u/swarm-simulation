@@ -21,7 +21,7 @@
 //! worlds, and it scales the startup cost with the world rather than with the constant.
 
 use boids_core::config::SimConfig;
-use boids_core::layout::{TerrainParams, TreeInstance};
+use boids_core::layout::{StaticInstance, TerrainParams};
 
 /// How far the map extends beyond the simulation's steering box, per axis.
 ///
@@ -199,13 +199,15 @@ impl TerrainGpu {
         queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
         let trees = make_buffer(
             "tree instances",
-            u64::from(capacity) * core::mem::size_of::<TreeInstance>() as u64,
+            u64::from(capacity) * core::mem::size_of::<StaticInstance>() as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
         let counters = make_buffer(
             "tree counter",
             4,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
         );
 
         let mut terrain = Self {
@@ -229,7 +231,12 @@ impl TerrainGpu {
         });
 
         // The map first: the scatter reads it.
-        let height_module = compile(device, &loader, "terrain/heightfield", "terrain/heightfield.wgsl");
+        let height_module = compile(
+            device,
+            &loader,
+            "terrain/heightfield",
+            "terrain/heightfield.wgsl",
+        );
         let height_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain heightfield layout"),
             entries: &[
@@ -260,20 +267,20 @@ impl TerrainGpu {
                 },
             ],
         });
-        let height_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("terrain heightfield pipeline layout"),
-            bind_group_layouts: &[Some(&height_layout)],
-            immediate_size: 0,
-        });
-        let height_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("terrain_heightfield"),
-                layout: Some(&height_pipeline_layout),
-                module: &height_module,
-                entry_point: Some("generate"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
+        let height_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("terrain heightfield pipeline layout"),
+                bind_group_layouts: &[Some(&height_layout)],
+                immediate_size: 0,
             });
+        let height_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("terrain_heightfield"),
+            layout: Some(&height_pipeline_layout),
+            module: &height_module,
+            entry_point: Some("generate"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("terrain heightfield"),
@@ -289,25 +296,27 @@ impl TerrainGpu {
         // against the array length, so a short buffer costs trees rather than validation errors.
         if self.params.tree_capacity > 0 {
             queue.write_buffer(&self.counters, 0, bytemuck::bytes_of(&0u32));
-            let scatter_module = compile(device, &loader, "terrain/scatter", "terrain/scatter.wgsl");
-            let scatter_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("terrain scatter layout"),
-                entries: &[
-                    uniform_entry(0),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+            let scatter_module =
+                compile(device, &loader, "terrain/scatter", "terrain/scatter.wgsl");
+            let scatter_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("terrain scatter layout"),
+                    entries: &[
+                        uniform_entry(0),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    storage_entry(2, false),
-                    storage_entry(3, false),
-                ],
-            });
+                        storage_entry(2, false),
+                        storage_entry(3, false),
+                    ],
+                });
             let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("terrain scatter"),
                 layout: &scatter_layout,
@@ -336,14 +345,15 @@ impl TerrainGpu {
                     bind_group_layouts: &[Some(&scatter_layout)],
                     immediate_size: 0,
                 });
-            let scatter_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("terrain_scatter"),
-                layout: Some(&scatter_pipeline_layout),
-                module: &scatter_module,
-                entry_point: Some("scatter"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
+            let scatter_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("terrain_scatter"),
+                    layout: Some(&scatter_pipeline_layout),
+                    module: &scatter_module,
+                    entry_point: Some("scatter"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("terrain scatter"),
                 timestamp_writes: None,
@@ -527,7 +537,10 @@ mod tests {
                 "{mode:?}: the map is narrower than the world it must cover"
             );
             assert!(p.size_xz[1] >= 2.0 * config.bounds_half.z);
-            assert!((p.min_xz[0] + 0.5 * p.size_xz[0]).abs() < 1e-3, "the map is not centred");
+            assert!(
+                (p.min_xz[0] + 0.5 * p.size_xz[0]).abs() < 1e-3,
+                "the map is not centred"
+            );
         }
     }
 

@@ -48,9 +48,10 @@ impl SceneBinding {
 /// The `@group(0)` layout shared by every pass that draws scene geometry or shades the medium.
 ///
 /// `SceneUniform` (304 bytes), the agent array, `WaterParams` (48), `InteractionUniforms` (48),
-/// `PostParams` (48), `TerrainParams` (48), the baked heightfield, the tree instances and `SkyParams`
-/// (48). The agents are a storage buffer rather than a vertex buffer, which is what lets a single draw
-/// call read 100k agents where the simulation left them; the trees are drawn the same way.
+/// `PostParams` (48), `TerrainParams` (48), the baked heightfield, the tree instances, `SkyParams`
+/// (48) and the landmark instances. The agents are a storage buffer rather than a vertex buffer, which
+/// is what lets a single draw call read 100k agents where the simulation left them; the trees and the
+/// landmarks are drawn the same way.
 #[derive(Debug)]
 pub struct SceneLayout {
     /// The bind group layout.
@@ -77,16 +78,19 @@ impl SceneLayout {
     /// `terrain` supplies the three static entries: its parameter buffer, the baked heightfield and
     /// the scattered tree instances. They are borrowed rather than rebuilt because the map costs a
     /// compute dispatch and a readback to produce, and two copies of it would be two chances for the
-    /// drawn ground to differ from the avoided ground.
+    /// drawn ground to differ from the avoided ground. `landmarks` is the castle instance buffer,
+    /// borrowed for the same reason: it is placed by a search and the pass that draws it must read
+    /// exactly what was placed.
     #[must_use]
     pub fn new(
         ctx: &GpuContext,
         boids: [&wgpu::Buffer; 2],
         terrain: &boids_scene::TerrainGpu,
+        landmarks: &wgpu::Buffer,
         sky: &SkyParams,
     ) -> Self {
-        let uniform_entry = |binding: u32, size: u64, stages: wgpu::ShaderStages| {
-            wgpu::BindGroupLayoutEntry {
+        let uniform_entry =
+            |binding: u32, size: u64, stages: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: stages,
                 ty: wgpu::BindingType::Buffer {
@@ -95,8 +99,7 @@ impl SceneLayout {
                     min_binding_size: wgpu::BufferSize::new(size),
                 },
                 count: None,
-            }
-        };
+            };
         let layout = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -168,6 +171,18 @@ impl SceneLayout {
                         core::mem::size_of::<SkyParams>() as u64,
                         wgpu::ShaderStages::FRAGMENT,
                     ),
+                    // Vertex only: the landmark instance is read once per instance to place the mesh,
+                    // and the fragment shader is handed everything it needs through the varyings.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -198,6 +213,7 @@ impl SceneLayout {
             buffers: [&wgpu::Buffer; 5],
             agents: &wgpu::Buffer,
             terrain: &boids_scene::TerrainGpu,
+            landmarks: &wgpu::Buffer,
         ) -> wgpu::BindGroup {
             ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("scene bind group"),
@@ -239,14 +255,18 @@ impl SceneLayout {
                         binding: 8,
                         resource: buffers[4].as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: landmarks.as_entire_binding(),
+                    },
                 ],
             })
         }
 
         let scene_buffers = [&uniform, &water, &interaction, &post, &sky_buffer];
         let bind_groups = [
-            make_bind_group(ctx, &layout, scene_buffers, boids[0], terrain),
-            make_bind_group(ctx, &layout, scene_buffers, boids[1], terrain),
+            make_bind_group(ctx, &layout, scene_buffers, boids[0], terrain, landmarks),
+            make_bind_group(ctx, &layout, scene_buffers, boids[1], terrain, landmarks),
         ];
 
         Self {

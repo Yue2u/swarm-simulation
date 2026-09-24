@@ -102,6 +102,22 @@ fish world is 91 x 40 x 91 = 331,240 cells, 1.3 MB per range array. The grid is 
 rather than a hash, so there are no collisions and no hash table, which `ADR-0003` records as a
 deliberate trade.
 
+The static scene content the render group binds (bindings 5-9) is sized from the world, not the agent
+count:
+
+| buffer | size | usage |
+|---|---|---|
+| `terrain params` | 48 | UNIFORM, COPY_DST |
+| `heightfield` | `resolution^2 * 16` (`resolution` clamped to 64..=1024, so 256 KB..16 MB) | TEXTURE_BINDING, COPY_DST (baked once) |
+| `trees` | `tree_capacity * 32` | STORAGE, COPY_DST |
+| `sky` | 48 | UNIFORM, COPY_DST |
+| `landmarks` | `LANDMARK_CAPACITY * 32` (128 B) | STORAGE, COPY_DST |
+
+The heightfield is baked by a compute dispatch at startup and never touched again; the trees are
+appended to by the scatter pass; the landmarks are written by the host when the drawn world changes. All
+four are borrowed by the scene bind group rather than copied, so the pass that draws the ground, the
+forest or the castle reads exactly what the field, the scatter or the placement produced.
+
 ## Render targets
 
 The scene is drawn into attachments the renderer owns, not into the swapchain; only the composite
@@ -172,12 +188,26 @@ ping-pong stays entirely inside group 1.
 | 2 | `water` uniform (`WaterParams`) | fragment |
 | 3 | `interaction` uniform (`InteractionUniforms`) | fragment |
 | 4 | `post` uniform (`PostParams`) | fragment |
+| 5 | `terrain` uniform (`TerrainParams`) | vertex + fragment |
+| 6 | heightfield (`Rgba32Float`, non-filterable, read with `textureLoad`) | vertex + fragment |
+| 7 | tree instances (`StaticInstance` array), read | vertex |
+| 8 | `sky` uniform (`SkyParams`) | fragment |
+| 9 | landmark instances (`StaticInstance` array), read | vertex |
 
 The agent buffer is bound as a storage buffer rather than a vertex buffer. Both parities are bound up
 front for the same reason as the simulation pair. `water`, `interaction` and `post` live here because
 every pass that shades the medium needs some of them, and one group means one `set_bind_group` per pass;
 `post` is the *same buffer* the post chain binds in its own group, so there is one upload per frame and
 one struct that can be stale (`boids-render/src/scene.rs`).
+
+Bindings 5-9 are the static scene content, borrowed from `boids-scene` rather than rebuilt per frame.
+The heightfield is `Rgba32Float` and read with `textureLoad` because a filterable 32-bit float texture
+would need a device feature; the ground pass and the tree scatter both read it, so the drawn ground and
+the avoided ground come from one map. The tree and landmark instance arrays share the `StaticInstance`
+element and the storage-buffer draw the agents use: the scatter appends trees and the host places the
+castle, and each pass draws however many there are. The two arrays are separate bindings because the
+tree pass and the landmark pass read different lists, and binding 9 is vertex-only because a landmark's
+transform is applied once per instance and the fragment shader is handed the result through varyings.
 
 **Group 0, post.** The bloom and composite passes use their own group, since they sample textures and
 read only `PostParams`:
@@ -281,12 +311,13 @@ scene pass (full HDR target + depth, depth cleared to 1.0)
                    Birds: background.wgsl    draw(0..3, 0..1)  compare Always, no depth write
   2. ground        terrain.wgsl              draw(0..segments^2*6, 0..1)  Birds only
   3. trees         tree.wgsl                 draw(0..tree_count*idx, 0..1)  Birds only
-  4. agents        boid.wgsl                 draw(0..66, 0..num_boids)  compare LessEqual, depth write
+  4. castle        landmark.wgsl             draw(0..index_count, 0..landmark_count)  both worlds
+  5. agents        boid.wgsl                 draw(0..66, 0..num_boids)  compare LessEqual, depth write
 post chain (no depth)
-  5. bloom bright  draw(0..3, 0..1)   hdr -> bloom[0]
-  6. bloom down    draw(0..3, 0..1)   bloom[i-1] -> bloom[i]
-  7. bloom up      draw(0..3, 0..1)   bloom[i] -> bloom[i-1], additive
-  8. composite     draw(0..3, 0..1)   hdr + bloom[0] -> swapchain
+  6. bloom bright  draw(0..3, 0..1)   hdr -> bloom[0]
+  7. bloom down    draw(0..3, 0..1)   bloom[i-1] -> bloom[i]
+  8. bloom up      draw(0..3, 0..1)   bloom[i] -> bloom[i-1], additive
+  9. composite     draw(0..3, 0..1)   hdr + bloom[0] -> swapchain
 ```
 
 The underwater environment writes `frag_depth` from the raymarched hit (`ADR-0005`), so the agent
@@ -295,12 +326,19 @@ the seafloor. The distance travels through the half-size pre-pass in the colour 
 because a depth texture cannot be sampled portably on every backend, and the resolve derives NDC depth
 from the metric distance at full precision. It runs first in the scene pass and with
 `CompareFunction::Always`, so it overwrites the clear rather than testing against it. The sky backdrop
-writes no depth; the terrain and the trees do, so a bird depth-tests against the ridge and the forest as
-well as against the flock.
+writes no depth; the terrain, the trees and the castle do, so a bird depth-tests against the ridge, the
+forest and a tower as well as against the flock. The castle is drawn in *both* worlds: underwater the
+ocean resolve has already written the seafloor's distance, so the buried plinth of a sunken castle is
+hidden by the sand it stands in, and in the sky world the terrain's distance hides a castle behind a
+ridge. Drawing it before the agents is what lets a bird disappear behind a tower.
 
-No pass has a vertex buffer. The agent mesh is a pure function of `vertex_index` (22 triangles: a
-body, a tail fin, and two wing triangles that are degenerate for fish), and the per-agent transform
-comes from the storage buffer indexed by `instance_index`.
+No *agent* pass has a vertex buffer. The agent mesh is a pure function of `vertex_index` (22 triangles:
+a body, a tail fin, and two wing triangles that are degenerate for fish), and the per-agent transform
+comes from the storage buffer indexed by `instance_index`. The terrain, the tree and the castle are the
+opposite case - host-built meshes drawn from vertex and index buffers - because their geometry is a
+one-time construction rather than a per-agent function. The tree tells its two materials apart by the
+sign of the normal's Y; the castle cannot, so its mesh carries a per-face `material` attribute the
+shader looks up in a palette.
 
 The vertex shader builds the orientation basis from the agent's velocity:
 
@@ -316,6 +354,25 @@ interpolating per-vertex normals. It is exact for the triangle actually rasteris
 animated deformation, needs no normal data in the mesh function, and cannot produce a wrong normal on a
 degenerate triangle because such a triangle has no pixels.
 
+### The castle
+
+The castle is the one static mesh drawn in both worlds, and the one piece of scene content placed by a
+*search* rather than by a scatter. `boids-scene/src/mesh.rs` builds it procedurally from boxes, quads
+and pyramids - a curtain wall with a gate, corner towers, a keep and a roof - and normalises it around
+its ground line so a scale factor is the castle's height in metres. `boids-scene/src/landmark.rs` then
+picks the site: the flattest ground near a preferred offset in the sky world, scored with the CPU twin
+of the terrain field, and the clearest water on the seafloor underwater, scored with the CPU twin of the
+reef SDF. That search runs on the host because there are one or two castles, not thousands, and because
+the fields it samples are the same ones the terrain mesh and the ocean raymarch are built from, so the
+drawn castle cannot stand inside the ground or a reef column it is drawn on.
+
+`LandmarkGpu` holds one instance buffer with both worlds' lists behind it, and `Renderer::render_into`
+uploads a world's list with a single 32-byte `write_buffer` when the world it draws changes. That keeps
+the `tab` switch's "nothing is reallocated" property: a world switch is the same size of write as a key
+press, and a frame that draws the same world as the last one writes nothing at all. The instance is the
+same `StaticInstance` the tree scatter produces, so binding 7 and binding 9 differ only in which list
+they read.
+
 ## Reference-space conventions
 
 | thing | convention |
@@ -325,4 +382,4 @@ degenerate triangle because such a triangle has no pixels.
 | camera | orbit around a target; `u32` viewport in physical pixels |
 | the screen-space Y flip | applied exactly once, in `ray_from_ndc` on the CPU and in the backdrop's deprojection on the GPU |
 | blend | none in the scene pass; the bloom upsample adds (`One`/`One`), the composite replaces |
-| winding | no culling; the fins and wings are single-sided by construction |
+| winding | the agent, backdrop and ocean passes cull nothing (the fins and wings are single-sided by construction); the terrain, tree and castle passes cull back faces |

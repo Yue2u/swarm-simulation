@@ -10,6 +10,7 @@
 //!      sky         render/background.wgsl     full-screen atmosphere, no depth
 //! 4. ground     render/terrain.wgsl        sky world only: vertex-pulled grid, writes depth
 //! 5. trees      render/tree.wgsl           sky world only: one instanced indexed draw
+//! 5b. castle    render/landmark.wgsl       both worlds: one instanced indexed draw
 //! 6. agents     render/boid.wgsl           one instanced draw, depth tested and writing
 //! 7. bloom      bright, downsample, additive upsample into the pyramid
 //! 8. composite  aberration, exposure, ACES tone map, grade -> the target
@@ -17,9 +18,11 @@
 //!
 //! Steps 3 to 6 share one render pass and one depth attachment: the resolve writes depth, the ground
 //! writes depth, and the agents compare against both, which is what puts a fish behind a column, a
-//! tree behind a ridge, and a bird in front of both. Step 2 is a pass of its own because its result
-//! has to be complete before the resolve samples it. Steps 7 and 8 are separate passes with no depth
-//! at all.
+//! tree behind a ridge, and a bird in front of both. The castle is drawn in both worlds for the same
+//! reason: underwater the seafloor's distance is already in the attachment, so the buried base of a
+//! sunken one is hidden by the sand it stands in, and in the sky world the terrain's is, so a castle
+//! behind a ridge is hidden by it. Step 2 is a pass of its own because its result has to be complete
+//! before the resolve samples it. Steps 7 and 8 are separate passes with no depth at all.
 //!
 //! # Why both worlds are built up front
 //!
@@ -29,22 +32,24 @@
 //! instead of a multi-second hitch. That is also why the post chain is shared rather than owned per
 //! world: the exposure differs, the chain does not.
 
+use boids_core::camera::OrbitCamera;
 use boids_core::config::SimConfig;
 use boids_core::layout::SimMode;
-use boids_core::layout::{
-    InteractionUniforms, PostParams, SceneUniform, SkyParams, WaterParams,
-};
+use boids_core::layout::{InteractionUniforms, PostParams, SceneUniform, SkyParams, WaterParams};
 use boids_gpu::context::GpuContext;
-use boids_scene::TerrainGpu;
+use boids_gpu::transfer::upload_uniform;
+use boids_scene::{LandmarkGpu, TerrainGpu};
 
 use crate::background::BackgroundPass;
 use crate::boid_pass::BoidPass;
+use crate::landmark::LandmarkPass;
 use crate::ocean::OceanPass;
 use crate::post::PostChain;
 use crate::scene::{SceneBinding, SceneLayout};
 use crate::targets::FrameTargets;
 use crate::terrain::TerrainPass;
 use crate::tree::TreePass;
+use crate::viewer::{Model, ModelViewer, STUDIO_BACKGROUND};
 
 /// What the renderer needs to know about this frame that is not in the scene uniform.
 #[derive(Debug, Clone, Copy)]
@@ -85,11 +90,21 @@ pub struct Renderer {
     ocean: OceanPass,
     terrain: TerrainPass,
     trees: TreePass,
+    /// The castle. Drawn in both worlds, so this is the one geometry pass that is not behind a
+    /// `world ==` test.
+    landmarks: LandmarkPass,
     boids: BoidPass,
     post: PostChain,
     /// The baked ground and its scattered trees, borrowed by the scene bind groups. Kept here so
     /// that its buffers outlive them, and so the frame graph can ask how many trees to draw.
     terrain_data: TerrainGpu,
+    /// The castle instances for both worlds, borrowed by the scene bind groups for the same reason as
+    /// the terrain: the buffer has to outlive the group, and the frame graph has to know how many
+    /// instances the world being drawn has.
+    landmark_data: LandmarkGpu,
+    /// The model viewer's single-instance buffers and its group 0. Built at startup because it needs
+    /// the scene layout, which is built here too.
+    viewer: ModelViewer,
     format: wgpu::TextureFormat,
     is_srgb: bool,
     last_size: (u32, u32),
@@ -116,13 +131,22 @@ impl Renderer {
         // reef-scaled parameters a map a fraction of the area the birds fly in, so switching to birds
         // would show a small island under a swarm spread across empty space. The underwater shaders
         // never sample the heightfield or the trees, so the binding is simply inert there.
+        let other_mode = match config.mode {
+            SimMode::Birds => SimMode::Fish,
+            SimMode::Fish => SimMode::Birds,
+        };
+        let other_config = SimConfig::for_mode(other_mode, config.num_boids);
         let terrain_config = match config.mode {
             SimMode::Birds => config.clone(),
-            SimMode::Fish => SimConfig::for_mode(SimMode::Birds, config.num_boids),
+            SimMode::Fish => other_config.clone(),
         };
         let terrain_data = TerrainGpu::new(&ctx.device, &ctx.queue, &terrain_config);
+        // Both worlds' castles are placed here, each from its own world's config: the placement is a
+        // search over the terrain or the reef, and running it on the frame the world changes would be
+        // a hitch in the middle of the transition. Only the world being drawn is uploaded.
+        let landmark_data = LandmarkGpu::new(&ctx.device, &ctx.queue, config, &other_config);
         let sky = boids_scene::sky_params(config.mode);
-        let scene = SceneLayout::new(ctx, boids, &terrain_data, &sky);
+        let scene = SceneLayout::new(ctx, boids, &terrain_data, landmark_data.buffer(), &sky);
         let targets = FrameTargets::new(&ctx.device, width, height);
         // The sky backdrop needs the format of the *scene* target now, not the swapchain: it draws
         // into the HDR intermediate like everything else, and the composite owns the swapchain.
@@ -130,7 +154,9 @@ impl Renderer {
         let ocean = OceanPass::new(ctx, &scene, &targets);
         let terrain = TerrainPass::new(ctx, &scene, &terrain_config);
         let trees = TreePass::new(ctx, &scene);
+        let landmarks = LandmarkPass::new(ctx, &scene);
         let boids_pass = BoidPass::new(ctx, &scene);
+        let viewer = ModelViewer::new(ctx, &scene, &terrain_data);
         let post = PostChain::new(
             ctx,
             format,
@@ -142,13 +168,15 @@ impl Renderer {
         );
         log::info!(
             "renderer: {}x{} swapchain {format:?} (srgb {is_srgb}), bloom {:?}, terrain {} tris, \
-             {} trees of {} tris",
+             {} trees of {} tris, {} landmarks of {} tris",
             width.max(1),
             height.max(1),
             post.bloom_size(),
             terrain.triangles(),
             terrain_data.tree_count(),
             trees.triangles_per_tree(),
+            landmark_data.count(config.mode),
+            landmarks.triangles_per_landmark(),
         );
         Self {
             targets,
@@ -157,9 +185,12 @@ impl Renderer {
             ocean,
             terrain,
             trees,
+            landmarks,
             boids: boids_pass,
             post,
             terrain_data,
+            landmark_data,
+            viewer,
             format,
             is_srgb,
             last_size: (width.max(1), height.max(1)),
@@ -195,8 +226,13 @@ impl Renderer {
         }
         // The post chain is rebuilt whenever the size *or* the HDR view changed, which the chain
         // decides for itself by comparing sizes; after a resize both have.
-        self.post
-            .resize(ctx, &self.scene.post, self.targets.hdr_view(), width, height);
+        self.post.resize(
+            ctx,
+            &self.scene.post,
+            self.targets.hdr_view(),
+            width,
+            height,
+        );
         self.last_size = self.targets.size;
     }
 
@@ -247,6 +283,11 @@ impl Renderer {
             &input.sky,
         );
 
+        // The landmark buffer holds one world's castles, so the renderer uploads the world's list
+        // when the world it draws changes. A no-op on every other frame, and a 32-byte write on the
+        // one where TAB was pressed: nothing is allocated, which is what keeps the switch free.
+        let landmark_count = self.landmark_data.upload(&ctx.queue, input.world);
+
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -277,7 +318,8 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.ocean.draw_raymarch(&mut pass, &self.scene, input.binding);
+            self.ocean
+                .draw_raymarch(&mut pass, &self.scene, input.binding);
             stats.draw_calls += 1;
         }
 
@@ -317,7 +359,9 @@ impl Renderer {
             //    full-size pass and writes its depth; the sky backdrop fills every pixel and leaves
             //    the far plane clear.
             match input.world {
-                SimMode::Fish => self.ocean.draw_resolve(&mut pass, &self.scene, input.binding),
+                SimMode::Fish => self
+                    .ocean
+                    .draw_resolve(&mut pass, &self.scene, input.binding),
                 SimMode::Birds => self.background.draw(&mut pass, &self.scene, input.binding),
             }
             stats.draw_calls += 1;
@@ -330,29 +374,144 @@ impl Renderer {
                 stats.triangles += u64::from(self.terrain.triangles());
 
                 let trees = self.terrain_data.tree_count();
-                self.trees.draw(&mut pass, &self.scene, input.binding, trees);
+                self.trees
+                    .draw(&mut pass, &self.scene, input.binding, trees);
                 if trees > 0 {
                     stats.draw_calls += 1;
                     stats.instances += u64::from(trees);
-                    stats.triangles += u64::from(trees) * u64::from(self.trees.triangles_per_tree());
+                    stats.triangles +=
+                        u64::from(trees) * u64::from(self.trees.triangles_per_tree());
                 }
             }
 
-            // 3. Agents: one instanced draw for the whole swarm, depth tested against whatever the
-            //    environment and the ground wrote.
+            // 3. The castle, in both worlds: on the terrain in the sky world and on the seafloor
+            //    underwater. After the environment, so the seafloor hides the buried base of a
+            //    sunken one, and before the agents, so a bird disappears behind a tower.
+            self.landmarks
+                .draw(&mut pass, &self.scene, input.binding, landmark_count);
+            if landmark_count > 0 {
+                stats.draw_calls += 1;
+                stats.triangles +=
+                    u64::from(landmark_count) * u64::from(self.landmarks.triangles_per_landmark());
+            }
+
+            // 4. Agents: one instanced draw for the whole swarm, depth tested against whatever the
+            //    environment, the ground and the castle wrote.
             self.boids
                 .draw(&mut pass, &self.scene, input.binding, input.num_agents);
             if input.num_agents > 0 {
                 stats.draw_calls += 1;
                 stats.instances += u64::from(input.num_agents);
-                stats.triangles += u64::from(input.num_agents)
-                    * u64::from(crate::boid_pass::MESH_TRIANGLES);
+                stats.triangles +=
+                    u64::from(input.num_agents) * u64::from(crate::boid_pass::MESH_TRIANGLES);
             }
         }
 
         // 3. Post: bloom pyramid, then the tone map into the caller's target.
         self.post.record(&mut encoder, target);
 
+        ctx.queue.submit(Some(encoder.finish()));
+        stats
+    }
+
+    /// Draws one mesh alone in a studio, for the model viewer.
+    ///
+    /// This is a second frame shape rather than a mode of [`Renderer::render_into`]: the scene's frame
+    /// is an environment, ground, vegetation, a castle and a swarm, and the viewer's is one object
+    /// against a flat background. What the two share is everything that decides what the object
+    /// *looks* like - the pipelines, the shaders, the scene layout and the post chain - so the viewer
+    /// cannot show a mesh that differs from the one the scene draws.
+    ///
+    /// The scene's own uniform and post buffers are written here, because the viewer's group 0 binds
+    /// them (the layout's group 0 is the scene's) and the post chain reads the same `post` buffer. No
+    /// scene pass runs while the viewer is open, so there is nothing to overwrite.
+    pub fn render_model(
+        &mut self,
+        ctx: &GpuContext,
+        target: &wgpu::TextureView,
+        model: Model,
+        camera: &OrbitCamera,
+        time: f32,
+    ) -> FrameStats {
+        let (width, height) = self.last_size;
+        #[allow(clippy::cast_precision_loss)]
+        let viewport = glam::Vec2::new(width as f32, height as f32);
+
+        // The world's own light, ambient and haze, so the fish is lit like a fish and the castle like
+        // a castle. Only the scale and the motion stretch are overridden: the scene sizes an agent by
+        // the perception radius, which is a framing decision and not part of the model.
+        let mut scene = boids_gpu::mesh_profile::scene_uniform(
+            camera.to_uniform(time, viewport),
+            model.world(),
+            1.0,
+            1.0,
+        );
+        scene.mesh.scale = 1.0;
+        scene.mesh.speed_ref = 1.0;
+        scene.fog_color = STUDIO_BACKGROUND;
+        upload_uniform(&ctx.queue, &self.scene.uniform, &scene);
+        // One grade for all four models, so they are comparable: each world's own exposure exists to
+        // put its environment on the tone curve, and the studio has no environment.
+        let post = boids_scene::post_params(SimMode::Birds, time);
+        upload_uniform(&ctx.queue, &self.scene.post, &post);
+
+        self.viewer.set_model(&ctx.queue, model);
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("model viewer"),
+            });
+        let mut stats = FrameStats::default();
+        {
+            let depth = self.targets.depth_view().clone();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("model viewer"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.targets.hdr_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // The studio background, in linear HDR: the composite's exposure and tone curve
+                        // turn it into the dark grey the models are shown against.
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(STUDIO_BACKGROUND[0]),
+                            g: f64::from(STUDIO_BACKGROUND[1]),
+                            b: f64::from(STUDIO_BACKGROUND[2]),
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            let group = self.viewer.bind_group();
+            match model {
+                Model::Fish | Model::Bird => self.boids.draw_bound(&mut pass, group, 1),
+                Model::Tree => self.trees.draw_bound(&mut pass, group, 1),
+                Model::Castle => self.landmarks.draw_bound(&mut pass, group, 1),
+            }
+            stats.draw_calls = 1;
+            stats.instances = 1;
+            stats.triangles = match model {
+                Model::Fish | Model::Bird => u64::from(crate::boid_pass::MESH_TRIANGLES),
+                Model::Tree => u64::from(self.trees.triangles_per_tree()),
+                Model::Castle => u64::from(self.landmarks.triangles_per_landmark()),
+            };
+        }
+
+        self.post.record(&mut encoder, target);
         ctx.queue.submit(Some(encoder.finish()));
         stats
     }

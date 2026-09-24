@@ -3,11 +3,11 @@
 GPU flocking simulation in pure Rust + `wgpu`: 50k-100k agents, two procedural worlds, and a cursor
 that pushes the swarm around.
 
-Days 1-3 of a four-day sprint are done. See [Status](#status) for exactly what runs today and
+Days 1-4 of a four-day sprint are done. See [Status](#status) for exactly what runs today and
 [PLAN.md](PLAN.md) for the full plan.
 
-![underwater](docs/screenshots/day3-fish.png)
-![sky](docs/screenshots/day3-birds.png)
+![underwater](docs/screenshots/day4-fish.png)
+![sky](docs/screenshots/day4-birds.png)
 
 ## Requirements
 
@@ -26,14 +26,16 @@ cargo build --release
 ./target/release/boids --agents 200000       # more agents (keys pad to the next power of two)
 ./target/release/boids --strategy naive      # force all-pairs, for an A/B comparison
 ./target/release/boids --bench 120           # headless per-pass GPU timings, then exit
+./target/release/boids --model castle        # open the model viewer on the castle
 ./target/release/boids --help
 ```
 
 Write a frame to a PNG without opening a window, which is also the visual regression entry point:
 
 ```bash
-./target/release/boids --fish  --agents 3000 --screenshot docs/screenshots/day3-fish.png
-./target/release/boids --birds --agents 3000 --screenshot docs/screenshots/day3-birds.png
+./target/release/boids --fish  --agents 3000 --screenshot docs/screenshots/day4-fish.png
+./target/release/boids --birds --agents 3000 --screenshot docs/screenshots/day4-birds.png
+./target/release/boids --model castle --screenshot docs/screenshots/castle.png
 ```
 
 ### Controls
@@ -51,6 +53,18 @@ Write a frame to a PNG without opening a window, which is also the visual regres
 | `space` | pause |
 | `r` | respawn the swarm |
 | `esc` | quit |
+
+The model viewer (`v`) shows one mesh at a time in a studio, through the same pipelines and post chain
+the world uses, so a model screenshot cannot drift from what the scene draws:
+
+| Input | Action |
+|---|---|
+| `v` | open or close the model viewer |
+| `1`..`4` | select fish, bird, tree or castle |
+| `[` / `]` | step through the models |
+| left drag / wheel | rotate and zoom the model |
+| `r` | reframe the camera |
+| `v` | back to the swarm |
 
 ## Tests
 
@@ -86,6 +100,7 @@ What the suites actually assert:
 | `sdf/wgsl_matches_rust` | a CPU/GPU divergence in the reef or terrain field, or a sign flip |
 | `render/background_has_structure` | a missing backdrop pass, or a flipped Y in the ray reconstruction |
 | `render/terrain_grounds_the_sky_world` | a terrain mesh with holes (the wrong triangle winding is culled) or no ground pass |
+| `render/landmark_is_drawn` | a castle mesh builder that returns nothing, a zero instance count, or binding 9 never reaching the vertex shader |
 | `render/agents_contribute_pixels` | a mesh function or instanced draw producing nothing |
 | `render/depth_is_written` | geometry rejected by the depth test (skipped where the backend cannot copy depth) |
 | `render/worlds_look_different` | a stale scene uniform, so the mode never reaches the shaders |
@@ -148,6 +163,15 @@ Day 4 adds:
 * **a 1.5 s world morph on `tab`**: the bodies, animation, emission and palette cross-fade through
   `boids_gpu::mesh_profile::scene_uniform_morph`, with the destination world's medium, without
   recreating the device or the surface,
+* **a procedural castle in both worlds**: a host-built mesh (curtain wall, gate, spired corner towers,
+  keep, chimney, slate roof and a cloth pennant, seven materials) placed by a search on the host - the
+  flattest ground in the sky world, the clearest water on the seafloor underwater - using the CPU twins
+  of the terrain and reef fields, so the drawn castle cannot stand inside the ground or a reef column it
+  is drawn on. One instance buffer holds a world's castle, uploaded with a 32-byte write when the drawn
+  world changes, so the `tab` switch still reallocates nothing,
+* **the model viewer** (`v`, or `--model fish|bird|tree|castle`): one mesh at a time in a studio,
+  drawn through the scene's own passes and post chain over a swapped group 0, so a model cannot drift
+  from what the world draws,
 * the terrain mesh winding, its slope shading and the spawn cluster were all fixed so the ground
   is solid, coloured, and under a single dense flock.
 
@@ -175,8 +199,8 @@ Not yet:
 crates/
   boids-core/    data contract, CPU reference, camera and ray math, SDF and terrain fields, WGSL loader
   boids-gpu/     device setup, buffers, compute pipelines, the device test suite
-  boids-scene/   water and post parameters, the atmosphere, and procedural art content (terrain, trees)
-  boids-render/  frame graph, passes, PNG output
+  boids-scene/   water and post parameters, the atmosphere, and procedural art content (terrain, trees, castle)
+  boids-render/  frame graph, passes, the model viewer, PNG output
   boids-app/     window, input, frame loop, CLI, screenshot mode
 shaders/         all WGSL, composed with a //#include preprocessor
 docs/            architecture, pipeline, math, performance, ADRs

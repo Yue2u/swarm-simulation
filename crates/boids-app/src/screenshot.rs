@@ -21,8 +21,16 @@ use boids_gpu::context::{GpuContext, GpuContextDescriptor};
 use boids_gpu::sim::{SimPipelines, SimResources, Strategy};
 use boids_render::renderer::{FrameInput, Renderer};
 use boids_render::targets::DEPTH_FORMAT;
-use boids_render::{png, readback, SceneBinding};
+use boids_render::{png, readback, Model, SceneBinding};
 use glam::Vec2;
+
+/// Azimuth the model viewer's camera starts at, radians. The same one the scene screenshots use, so a
+/// model and the world it belongs to are seen from the same side.
+const VIEWER_YAW: f32 = 0.7;
+
+/// Field of view of the model viewer, radians. Narrower than the scene's: the studio frames one
+/// object, and a wide lens on a small object is all perspective distortion.
+const VIEWER_FOV: f32 = 45f32.to_radians();
 
 /// Everything a screenshot needs.
 #[derive(Debug, Clone)]
@@ -47,6 +55,11 @@ pub struct ScreenshotRequest {
     pub camera_pitch: f32,
     /// Neighbour search to force, or `None` to pick one from the agent count.
     pub strategy: Option<Strategy>,
+    /// Render this mesh alone in the model viewer's studio instead of the world.
+    ///
+    /// The same code path the interactive viewer uses, so a screenshot of a model is the model the
+    /// viewer shows and not a second rendering of it.
+    pub model: Option<Model>,
 }
 
 impl Default for ScreenshotRequest {
@@ -61,9 +74,12 @@ impl Default for ScreenshotRequest {
             width: 1_280,
             height: 720,
             seed: 1,
-            camera_distance: 1.1,
-            camera_pitch: 0.22,
+            // Pulled back from the swarm's own framing so the 3x landmark fits: the castle now stands
+            // most of the world's half-height, and a camera sized for the flock alone crops its towers.
+            camera_distance: 1.8,
+            camera_pitch: 0.18,
             strategy: None,
+            model: None,
         }
     }
 }
@@ -99,12 +115,19 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
     let strategy = request
         .strategy
         .unwrap_or_else(|| Strategy::for_count(config.num_boids as u32));
+    // A model render does not need a settled swarm: nothing of the simulation is drawn. Skipping the
+    // warmup makes `--model` a fraction of a second rather than a few.
+    let warmup_steps = if request.model.is_some() {
+        0
+    } else {
+        request.warmup_steps
+    };
     let mut encoder = ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("screenshot warmup"),
         });
-    for _ in 0..request.warmup_steps {
+    for _ in 0..warmup_steps {
         pipes.record_step(&mut encoder, &sim, strategy, &mut None);
         sim.swap();
     }
@@ -138,6 +161,37 @@ pub fn capture(request: &ScreenshotRequest) -> Result<(), String> {
 
     #[allow(clippy::cast_precision_loss)]
     let (width_f, height_f) = (request.width as f32, request.height as f32);
+
+    // The model viewer, when one was asked for: the same call the interactive viewer makes, into the
+    // same off-screen target, so the picture is the viewer's picture and not a second rendering.
+    if let Some(model) = request.model {
+        let camera = OrbitCamera {
+            target: model.target(),
+            distance: model.distance(),
+            yaw: VIEWER_YAW,
+            pitch: model.pitch(),
+            fov_y: VIEWER_FOV,
+            // Close, because the models are about one unit across: a 0.5 near plane would put the
+            // camera inside the mesh it is framing.
+            near: 0.02,
+            far: 100.0,
+            aspect: width_f / height_f,
+        };
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let stats = renderer.render_model(&ctx, &color_view, model, &camera, 0.0);
+        let pixels = readback::read_texture_rgba(&ctx, &color, request.width, request.height)?;
+        png::write_png_rgba(&request.path, request.width, request.height, &pixels)?;
+        log::info!(
+            "wrote {} ({}x{}, model {}, {} triangles)",
+            request.path.display(),
+            request.width,
+            request.height,
+            model.label(),
+            stats.triangles,
+        );
+        return Ok(());
+    }
+
     let camera = OrbitCamera {
         target: config.spawn_center,
         distance: config.bounds_half.length() * request.camera_distance,

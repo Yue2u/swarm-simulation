@@ -30,6 +30,7 @@ mod screenshot;
 use app::BoidsApp;
 use boids_core::layout::SimMode;
 use boids_gpu::sim::Strategy;
+use boids_render::Model;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() {
@@ -67,6 +68,23 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        // The OBJ export is pure CPU: it builds the same mesh the renderer uploads and writes it, so
+        // it runs on a machine with no GPU at all.
+        Invocation::Export(path) => {
+            let mesh = boids_scene::mesh::castle_mesh();
+            match boids_scene::mesh::write_obj(&mesh, &path) {
+                Ok(()) => log::info!(
+                    "wrote {} ({} vertices, {} triangles)",
+                    path.display(),
+                    mesh.vertices.len(),
+                    mesh.triangle_count()
+                ),
+                Err(e) => {
+                    log::error!("export failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Invocation::Window(startup) => run_window(startup),
     }
 }
@@ -99,6 +117,8 @@ enum Invocation {
     Screenshot(Box<screenshot::ScreenshotRequest>),
     /// Time a headless simulation and print the per-pass breakdown.
     Bench(Box<bench::BenchRequest>),
+    /// Write a static mesh to a Wavefront OBJ and exit.
+    Export(std::path::PathBuf),
 }
 
 /// The flags that describe the world, whichever mode consumes them.
@@ -115,6 +135,8 @@ struct WorldFlags {
     deterministic: bool,
     profile: bool,
     strategy: Option<Strategy>,
+    /// The mesh the model viewer opens on, from `--model`.
+    model: Option<Model>,
 }
 
 /// Which headless mode was asked for, if any.
@@ -122,6 +144,8 @@ struct WorldFlags {
 enum Headless {
     Screenshot(std::path::PathBuf),
     Bench(usize),
+    /// Write a static mesh to a Wavefront OBJ and exit. Needs no device at all.
+    Export(std::path::PathBuf),
 }
 
 /// Parses the command line.
@@ -165,6 +189,13 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
             }
             "--fish" => world.mode = Some(SimMode::Fish),
             "--birds" => world.mode = Some(SimMode::Birds),
+            "--model" => {
+                let value = required(args, &mut cursor, arg)?;
+                world.model = Some(Model::from_name(value).ok_or_else(|| {
+                    let names: Vec<&str> = Model::ALL.iter().map(|m| m.label()).collect();
+                    format!("--model {value}: expected one of {}", names.join(", "))
+                })?);
+            }
             "--deterministic" => world.deterministic = true,
             "--profile" => world.profile = true,
             "--screenshot" => {
@@ -184,6 +215,10 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 };
                 set_headless(&mut headless, Headless::Bench(frames))?;
             }
+            "--export-castle" => {
+                let path = required(args, &mut cursor, arg)?.into();
+                set_headless(&mut headless, Headless::Export(path))?;
+            }
             "--help" | "-h" => return Ok(Invocation::Help),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -199,6 +234,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
                     num_agents: world.num_agents.unwrap_or(defaults.num_agents),
                     seed: world.seed.unwrap_or(defaults.seed),
                     strategy: world.strategy,
+                    model: world.model,
                     ..defaults
                 },
             )))
@@ -217,6 +253,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 ..defaults
             })))
         }
+        Some(Headless::Export(path)) => Ok(Invocation::Export(path)),
         None => {
             let defaults = app::StartupConfig::default();
             Ok(Invocation::Window(app::StartupConfig {
@@ -226,6 +263,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 deterministic: world.deterministic,
                 profile: world.profile,
                 strategy: world.strategy,
+                viewer: world.model,
             }))
         }
     }
@@ -246,7 +284,10 @@ fn required<'a>(args: &'a [String], cursor: &mut usize, flag: &str) -> Result<&'
 /// Records the requested headless mode, refusing to guess between two.
 fn set_headless(slot: &mut Option<Headless>, request: Headless) -> Result<(), String> {
     if slot.is_some() {
-        return Err("--bench and --screenshot both render headlessly: ask for one of them".into());
+        return Err(
+            "--bench, --screenshot and --export-castle each run headlessly: ask for one of them"
+                .into(),
+        );
     }
     *slot = Some(request);
     Ok(())
@@ -262,11 +303,14 @@ fn usage() -> &'static str {
      --strategy <S>     neighbour search: naive, grid, or auto by agent count (default auto)\n    \
      --fish             start in the underwater world (default)\n    \
      --birds            start in the sky world\n    \
+     --model <M>        open the model viewer on fish, bird, tree or castle\n    \
      --deterministic    fixed timestep, for screenshot comparison\n    \
      --profile          log per-pass GPU timings once a second\n    \
      --bench <N>        time N headless simulation frames and print a per-pass\n    \
                         breakdown, then exit\n    \
-     --screenshot <f>   render one frame headlessly to a PNG and exit\n    \
+     --screenshot <f>   render one frame headlessly to a PNG and exit; with\n    \
+                        --model, render that model alone\n    \
+     --export-castle <f>  write the castle mesh as a Wavefront OBJ and exit\n    \
      -h, --help         print this help\n\n\
      CONTROLS:\n    \
      left drag          orbit the camera\n    \
@@ -278,7 +322,13 @@ fn usage() -> &'static str {
      tab                switch between fish and birds\n    \
      space              pause\n    \
      r                  reset the swarm\n    \
-     esc                quit"
+     esc                quit\n\n\
+     MODEL VIEWER (v):\n    \
+     left drag          rotate the model\n    \
+     wheel              zoom\n    \
+     1..4 / [ ]         select fish, bird, tree, castle\n    \
+     r                  reframe the camera\n    \
+     v                  back to the swarm"
 }
 
 #[cfg(test)]

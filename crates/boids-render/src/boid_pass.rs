@@ -106,11 +106,26 @@ impl BoidPass {
         binding: SceneBinding,
         num_agents: u32,
     ) {
+        self.draw_bound(pass, scene.bind_group(binding), num_agents);
+    }
+
+    /// Records the swarm draw over an explicit group 0.
+    ///
+    /// [`BoidPass::draw`] is the scene's path and binds the parity group the simulation just wrote.
+    /// This one exists for the model viewer, which binds the same layout over a single synthetic
+    /// agent: one agent, the same mesh, the same shader, so the viewer cannot show a different
+    /// creature from the one in the scene.
+    pub fn draw_bound<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        group: &'a wgpu::BindGroup,
+        num_agents: u32,
+    ) {
         if num_agents == 0 {
             return;
         }
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, scene.bind_group(binding), &[]);
+        pass.set_bind_group(0, group, &[]);
         pass.draw(0..MESH_VERTICES, 0..num_agents);
     }
 }

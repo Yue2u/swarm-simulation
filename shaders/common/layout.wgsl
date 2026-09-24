@@ -298,10 +298,10 @@ struct SkyParams {
 }
 
 // One scattered tree. Storage buffer element, not a uniform: the scatter pass appends and the tree
-// pass draws `count` of them. Mirrors `TreeInstance` in `crates/boids-core/src/layout.rs`.
+// pass draws `count` of them. Mirrors `StaticInstance` in `crates/boids-core/src/layout.rs`.
 //
 // 32 bytes so the array stride is a multiple of 16.
-struct TreeInstance {
+struct StaticInstance {
     // 0
     // Base position (on the ground), metres.
     pos: vec3<f32>,

@@ -21,8 +21,8 @@ nothing but `glam` and `bytemuck`.
 |---|---|---|
 | `boids-core` | every `#[repr(C)]` struct that WGSL also declares, the CPU reference implementation of a step, camera and cursor-ray math, the SDF and terrain fields with their CPU twins, the deterministic RNG and swarm spawn, the `//#include` WGSL preprocessor | any `wgpu` type at all. It builds and tests without a GPU, which is why the force model can be developed and refuted in seconds |
 | `boids-gpu` | adapter/device/surface acquisition, the ping-pong agent buffers, the spatial grid buffers, the parameter uniforms, the compute pipelines and their bind groups | rendering, biomes, input |
-| `boids-scene` | the per-world numbers behind the look: water medium and reef geometry, post-processing parameters, and (day 4) heightfields, biomes, palettes and mesh prototypes | computation or presentation |
-| `boids-render` | the frame graph: HDR and depth targets, scene uniform and its parity bind groups, the sky backdrop, the underwater raymarch, the agent pass, the bloom pyramid and the composite, texture readback, PNG output | simulation state or input |
+| `boids-scene` | the per-world numbers behind the look: water medium and reef geometry, post-processing parameters, and (day 4) heightfields, biomes, palettes, mesh prototypes and the castle placement | computation or presentation |
+| `boids-render` | the frame graph: HDR and depth targets, scene uniform and its parity bind groups, the sky backdrop, the underwater raymarch, the agent pass, the terrain, tree and landmark passes, the model viewer, the bloom pyramid and the composite, texture readback, PNG output | simulation state or input |
 | `boids-app` | the window, input accumulation, the camera, the frame loop, the mode switch, the CLI, headless screenshots | anything that knows how a pass works |
 
 The split exists so that a change to the force model cannot require a GPU, and a change to a shader
@@ -56,21 +56,23 @@ A frame moves data in one direction. The CPU writes four small uniform structs a
   7. environment        sky: full-screen atmosphere, no depth write
                         sea: full-res resolve into the scene target, writes depth
   8. ground + trees     sky world only: vertex-pulled terrain, instanced trees, depth write
-  9. agent pass         one instanced draw, depth test LessEqual, depth write
-                                       |
- 10. bloom              bright, two downsamples, two additive upsamples
- 11. composite          aberration, exposure, ACES, grade -> swapchain
-                                       |
- 12. present
+  9. castle             both worlds: one instanced indexed draw, depth write
+ 10. agent pass         one instanced draw, depth test LessEqual, depth write
+                                        |
+ 11. bloom              bright, two downsamples, two additive upsamples
+ 12. composite          aberration, exposure, ACES, grade -> swapchain
+                                        |
+ 13. present
 ```
 
-Passes 7, 8 and 9 share one render pass and one depth attachment, which is what puts a fish behind a
-column and a bird behind a ridge: the resolve and the terrain write real distances and the agent pass
-tests against them. The underwater raymarch itself runs one pass earlier, at half resolution, and hands
-its colour and hit distance to the resolve through one `Rgba16Float` target. Passes 10 and 11 run on the
-`Rgba16Float` intermediate and a three-level bloom pyramid, with no depth; the composite owns the
-transfer function. The render graph and why the intermediate is HDR rather than 8-bit are `ADR-0004`;
-why the underwater environment is a raymarch that ends in a depth-writing resolve is `ADR-0005`.
+Passes 7 to 10 share one render pass and one depth attachment, which is what puts a fish behind a
+column, a bird behind a ridge and a bird behind a tower: the resolve and the terrain write real
+distances and the agent pass tests against them. The underwater raymarch itself runs one pass earlier,
+at half resolution, and hands its colour and hit distance to the resolve through one `Rgba16Float`
+target. Passes 11 and 12 run on the `Rgba16Float` intermediate and a three-level bloom pyramid, with no
+depth; the composite owns the transfer function. The render graph and why the intermediate is HDR
+rather than 8-bit are `ADR-0004`; why the underwater environment is a raymarch that ends in a
+depth-writing resolve is `ADR-0005`.
 
 Passes 1-4 build the spatial grid and are what `Strategy::Grid` records; `Strategy::Naive` skips them
 and runs an all-pairs search in pass 5 instead, which is exact and faster below the crossover in
@@ -160,10 +162,11 @@ keys against a CPU bitonic sort, the range invariants, an unprepared grid findin
 grid search agreeing with all-pairs after one step and over a long run.
 
 **Render checks** (`boids-render/tests/render_suite`). Renders real frames off screen and asserts
-properties of the pixels and the depth buffer: structure in the backdrop, agents contributing pixels,
-depth written and plausible, the two worlds differing, the ocean raymarch writing real distances, the
-water being blue-dominant, bloom adding light, and the cursor marker being visible. This is the only
-automated way to know a picture was produced at all.
+properties of the pixels and the depth buffer: structure in the backdrop, the terrain grounding the sky
+world, the castle reaching the screen, agents contributing pixels, depth written and plausible, the two
+worlds differing, the ocean raymarch writing real distances, the water being blue-dominant, bloom adding
+light, and the cursor marker being visible. This is the only automated way to know a picture was
+produced at all.
 
 Capability gaps are reported as *skipped*, with the reason, rather than failed: a suite that is red
 because a backend cannot copy depth to a buffer is a suite people stop reading.

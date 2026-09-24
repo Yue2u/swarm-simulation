@@ -38,7 +38,7 @@
 @group(0) @binding(5) var<storage, read> post_in: PostParams;
 @group(0) @binding(6) var<storage, read> terrain_in: TerrainParams;
 @group(0) @binding(7) var<storage, read> sky_in: SkyParams;
-@group(0) @binding(8) var<storage, read> tree_in: TreeInstance;
+@group(0) @binding(8) var<storage, read> tree_in: StaticInstance;
 
 // Number of scalar slots the probe writes. Must match PROBE_SLOTS on the host.
 const PROBE_SLOTS: u32 = 120u;
@@ -182,7 +182,7 @@ fn probe(@builtin(global_invocation_id) gid: vec3<u32>) {
     out[106] = s.horizon_boost;
     out[107] = s.aerial_boost;
 
-    // --- TreeInstance: 8 scalars, indices 108..116 ---
+    // --- StaticInstance: 8 scalars, indices 108..116 ---
     let tr = tree_in;
     out[108] = tr.pos.x;
     out[109] = tr.pos.y;

@@ -13,7 +13,7 @@
 
 use boids_core::layout::{
     Boid, CameraUniform, InteractionUniforms, MeshParams, PostParams, SceneUniform, SimParams,
-    SkyParams, TerrainParams, TreeInstance, WaterParams,
+    SkyParams, StaticInstance, TerrainParams, WaterParams,
 };
 use boids_gpu::context::GpuContext;
 use boids_gpu::transfer::read_buffer;
@@ -172,13 +172,13 @@ fn expected_offsets() -> Vec<(usize, u32, Kind)> {
     scalar!(out, 106, SkyParams, horizon_boost, Kind::F32);
     scalar!(out, 107, SkyParams, aerial_boost, Kind::F32);
 
-    // TreeInstance, slots 108..116.
-    triple!(out, 108, TreeInstance, pos, Kind::F32);
-    scalar!(out, 111, TreeInstance, scale, Kind::F32);
-    scalar!(out, 112, TreeInstance, yaw, Kind::F32);
-    scalar!(out, 113, TreeInstance, kind, Kind::F32);
-    scalar!(out, 114, TreeInstance, mask, Kind::F32);
-    scalar!(out, 115, TreeInstance, pad1, Kind::F32);
+    // StaticInstance, slots 108..116.
+    triple!(out, 108, StaticInstance, pos, Kind::F32);
+    scalar!(out, 111, StaticInstance, scale, Kind::F32);
+    scalar!(out, 112, StaticInstance, yaw, Kind::F32);
+    scalar!(out, 113, StaticInstance, kind, Kind::F32);
+    scalar!(out, 114, StaticInstance, mask, Kind::F32);
+    scalar!(out, 115, StaticInstance, pad1, Kind::F32);
 
     out
 }
@@ -357,8 +357,18 @@ fn describe(v: f32) -> String {
 /// pointing at a `const _` block.
 pub fn struct_sizes_are_exact(_ctx: &GpuContext) -> Check {
     let table: [(&str, usize, usize, usize); 12] = [
-        ("Boid", core::mem::size_of::<Boid>(), core::mem::align_of::<Boid>(), 48),
-        ("SimParams", core::mem::size_of::<SimParams>(), core::mem::align_of::<SimParams>(), 144),
+        (
+            "Boid",
+            core::mem::size_of::<Boid>(),
+            core::mem::align_of::<Boid>(),
+            48,
+        ),
+        (
+            "SimParams",
+            core::mem::size_of::<SimParams>(),
+            core::mem::align_of::<SimParams>(),
+            144,
+        ),
         (
             "InteractionUniforms",
             core::mem::size_of::<InteractionUniforms>(),
@@ -371,7 +381,12 @@ pub fn struct_sizes_are_exact(_ctx: &GpuContext) -> Check {
             core::mem::align_of::<CameraUniform>(),
             192,
         ),
-        ("MeshParams", core::mem::size_of::<MeshParams>(), core::mem::align_of::<MeshParams>(), 80),
+        (
+            "MeshParams",
+            core::mem::size_of::<MeshParams>(),
+            core::mem::align_of::<MeshParams>(),
+            80,
+        ),
         (
             "SceneUniform",
             core::mem::size_of::<SceneUniform>(),
@@ -409,9 +424,9 @@ pub fn struct_sizes_are_exact(_ctx: &GpuContext) -> Check {
             48,
         ),
         (
-            "TreeInstance",
-            core::mem::size_of::<TreeInstance>(),
-            core::mem::align_of::<TreeInstance>(),
+            "StaticInstance",
+            core::mem::size_of::<StaticInstance>(),
+            core::mem::align_of::<StaticInstance>(),
             32,
         ),
     ];
@@ -419,10 +434,14 @@ pub fn struct_sizes_are_exact(_ctx: &GpuContext) -> Check {
     let mut problems = Vec::new();
     for (name, size, align, expected_size) in table {
         if size != expected_size {
-            problems.push(format!("{name} is {size} bytes, WGSL mirror expects {expected_size}"));
+            problems.push(format!(
+                "{name} is {size} bytes, WGSL mirror expects {expected_size}"
+            ));
         }
         if align != 16 && name != "KeyVal" {
-            problems.push(format!("{name} alignment is {align}, expected 16 for std430"));
+            problems.push(format!(
+                "{name} alignment is {align}, expected 16 for std430"
+            ));
         }
     }
     if problems.is_empty() {

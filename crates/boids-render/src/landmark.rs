@@ -1,54 +1,53 @@
-//! The sky world's trees: one indexed instanced draw over the scatter pass's instance buffer.
+//! The castle: one indexed instanced draw over the host-placed landmark instance buffer.
 //!
-//! # Why this pass has a vertex buffer and the agent pass does not
+//! # Where it sits in the frame
 //!
-//! An agent's mesh is animated per agent and generated from `vertex_index` because 100k instances
-//! cannot afford to read a vertex buffer. A tree is static and is drawn a few thousand times, so the
-//! mesh is built once on the host ([`boids_scene::mesh::tree_mesh`]), uploaded once, and read by the
-//! GPU as an ordinary vertex buffer. The *instances* come from a storage buffer the scatter pass
-//! filled, exactly as the agents do, so the per-frame CPU cost is still a single draw call.
+//! In both worlds, after the environment and before the agents. That order is what makes the depth
+//! test mean something in each: underwater the ocean resolve has already written the seafloor's
+//! distance, so the buried part of a sunken castle is hidden by the sand it stands in; in the sky
+//! world the terrain and the trees have written theirs, so a castle behind a ridge is hidden by it.
+//! Drawing it before the agents is what lets a bird disappear behind a tower.
 //!
 //! # Cost
 //!
-//! Up to `tree_capacity` instances of 136 triangles. At the app's world that is about 1,900 trees and
-//! 260k triangles, which is more than the terrain and a fifth of the agent draw. The lever is the
-//! scatter's coverage constant, not the mesh.
+//! `index_count` triangles per landmark, one instance each: about 1,100 triangles per world per
+//! frame, which is under a hundredth of the agent draw and about 1/250th of the forest. The mesh is
+//! built once on the host and uploaded once, exactly like the tree mesh, and the instances are the
+//! same storage-buffer trick, so the per-frame CPU cost is a single draw call.
+//!
+//! # Why the material is a vertex attribute
+//!
+//! The tree separates trunk from canopy with the sign of the normal's Y, which works because a tree
+//! has exactly two materials and one of them faces up. A castle has five - stone, slate, rock, iron,
+//! cloth - and they are not separable by orientation: a battlement cap and a courtyard floor both
+//! face up and are both stone, while the keep's roof faces up and is not. So the mesh carries the
+//! material per face and the shader looks it up in a palette.
 
-use boids_scene::mesh::{tree_mesh, MeshVertex};
+use boids_scene::mesh::{castle_mesh, MeshVertex};
 
 use crate::scene::SceneLayout;
 use crate::targets::HDR_FORMAT;
+use crate::tree::STATIC_MESH_ATTRIBUTES;
 
-/// Vertex attributes of a static mesh vertex: position, normal, material.
-///
-/// Defined here and shared with `crate::landmark`: both passes draw a `boids_scene::StaticMesh`, and
-/// two copies of this array would be two chances for one of them to stop matching `MeshVertex`.
-///
-/// The material is a number rather than a colour so the palette stays in the shader, where the
-/// lighting acts on it. The tree reads it as "no override" and splits its own two materials from the
-/// normal's Y; the castle reads it as its five.
-pub(crate) const STATIC_MESH_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32];
-
-/// The tree pipeline plus its mesh and instance count.
+/// The castle pipeline plus its mesh.
 #[derive(Debug)]
-pub struct TreePass {
+pub struct LandmarkPass {
     pipeline: wgpu::RenderPipeline,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
 }
 
-impl TreePass {
+impl LandmarkPass {
     /// Builds the mesh and the pipeline.
     ///
     /// # Panics
     /// Panics if the shader fails to compile. That is a programming error and belongs at startup.
     #[must_use]
     pub fn new(ctx: &boids_gpu::context::GpuContext, scene: &SceneLayout) -> Self {
-        let mesh = tree_mesh();
+        let mesh = castle_mesh();
         let vertices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tree vertices"),
+            label: Some("landmark vertices"),
             size: (mesh.vertices.len() * core::mem::size_of::<MeshVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -56,7 +55,7 @@ impl TreePass {
         ctx.queue
             .write_buffer(&vertices, 0, bytemuck::cast_slice(&mesh.vertices));
         let indices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tree indices"),
+            label: Some("landmark indices"),
             size: (mesh.indices.len() * core::mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -67,15 +66,15 @@ impl TreePass {
         let pipeline_layout = ctx
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("tree pipeline layout"),
+                label: Some("landmark pipeline layout"),
                 bind_group_layouts: &[Some(&scene.layout)],
                 immediate_size: 0,
             });
-        let module = ctx.shader_module("tree", "render/tree.wgsl");
+        let module = ctx.shader_module("landmark", "render/landmark.wgsl");
         let pipeline = ctx
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("tree"),
+                label: Some("landmark"),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &module,
@@ -118,7 +117,7 @@ impl TreePass {
         #[allow(clippy::cast_possible_truncation)]
         let index_count = mesh.indices.len() as u32;
         log::debug!(
-            "tree mesh: {} vertices, {} triangles",
+            "castle mesh: {} vertices, {} triangles",
             mesh.vertices.len(),
             mesh.triangle_count()
         );
@@ -130,17 +129,16 @@ impl TreePass {
         }
     }
 
-    /// Triangles one tree contributes.
+    /// Triangles one landmark contributes.
     #[must_use]
-    pub const fn triangles_per_tree(&self) -> u32 {
+    pub const fn triangles_per_landmark(&self) -> u32 {
         self.index_count / 3
     }
 
-    /// Records the trees into an already-open render pass.
+    /// Records the landmarks into an already-open render pass.
     ///
-    /// `count` comes from the scatter pass and is zero for a world with no vegetation, in which case
-    /// nothing is recorded at all: an instanced draw with zero instances is legal, but skipping it is
-    /// clearer in a capture and costs nothing.
+    /// `count` is the number of instances the renderer uploaded for the world being drawn, and is
+    /// zero for a world that places none, in which case nothing is recorded at all.
     pub fn draw<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
@@ -151,8 +149,8 @@ impl TreePass {
         self.draw_bound(pass, scene.bind_group(binding), count);
     }
 
-    /// Records the trees over an explicit group 0. See [`TreePass::draw`]; the model viewer is the
-    /// caller that needs it, binding the same layout over a single tree at the origin.
+    /// Records the landmarks over an explicit group 0. See [`LandmarkPass::draw`]; the model viewer is
+    /// the caller that needs it, binding the same layout over a single castle at the origin.
     pub fn draw_bound<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,

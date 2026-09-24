@@ -9,20 +9,21 @@
 //   @binding(4) post        uniform PostParams          (exposure, bloom, lens terms)
 //   @binding(5) terrain     uniform TerrainParams       (heightfield geometry and vegetation)
 //   @binding(6) heightfield texture_2d<f32>             (baked height in r, biome mask in g)
-//   @binding(7) trees       storage array<TreeInstance> (read, scattered by the terrain scatter pass)
+//   @binding(7) trees       storage array<StaticInstance> (read, scattered by the terrain scatter pass)
 //   @binding(8) sky         uniform SkyParams           (atmospheric scattering coefficients)
+//   @binding(9) landmarks   storage array<StaticInstance> (read, the castle, placed on the host)
 //
 // The boid array is bound as a *storage buffer* rather than a vertex buffer, and the vertex shader
 // indexes it with `instance_index`. That is what makes instanced drawing of 100k agents possible
 // without a per-frame upload or an instancing vertex buffer: the simulation already produced the data
 // on the GPU and the draw call reads it where it lies.
 //
-// `water`, `interaction`, `post`, `terrain`, `heightfield`, `trees` and `sky` are here rather than in
-// pass-specific groups for the same reason the simulation keeps its uniforms in one group: several
-// passes need some of them, and one group means one bind group set per pass instead of several. A
-// pass that needs none of them (the bloom pyramid) still binds the group, which costs a bind and no
-// bandwidth. The post passes (bloom, composite) do *not* use this group; they sample textures and
-// have their own.
+// `water`, `interaction`, `post`, `terrain`, `heightfield`, `trees`, `sky` and `landmarks` are here
+// rather than in pass-specific groups for the same reason the simulation keeps its uniforms in one
+// group: several passes need some of them, and one group means one bind group set per pass instead
+// of several. A pass that needs none of them (the bloom pyramid) still binds the group, which costs a
+// bind and no bandwidth. The post passes (bloom, composite) do *not* use this group; they sample
+// textures and have their own.
 //
 // Header only: declares bindings and pure helpers, no entry points.
 
@@ -37,8 +38,11 @@
 @group(0) @binding(4) var<uniform> post: PostParams;
 @group(0) @binding(5) var<uniform> terrain: TerrainParams;
 @group(0) @binding(6) var heightfield: texture_2d<f32>;
-@group(0) @binding(7) var<storage, read> trees: array<TreeInstance>;
+@group(0) @binding(7) var<storage, read> trees: array<StaticInstance>;
 @group(0) @binding(8) var<uniform> sky: SkyParams;
+// The castle, in both worlds. Placed on the host rather than scattered on the GPU, because there is
+// one per world and its position is a search (`boids_scene::landmark`), not a sampling.
+@group(0) @binding(9) var<storage, read> landmarks: array<StaticInstance>;
 
 // ---------------------------------------------------------------------------------------------
 // Shared scene helpers

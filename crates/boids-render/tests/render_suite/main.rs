@@ -21,6 +21,9 @@
 //!   that thresholds everything away, a pyramid that never gets read, and a composite that ignores it.
 //! * `focus_marker_is_visible` - the cursor's influence point is drawn, which catches the marker being
 //!   culled by the environment depth or the interaction uniform never reaching the shader.
+//! * `landmark_is_drawn` - the castle mesh reaches the screen through the landmark pass, which catches
+//!   a mesh builder that returns nothing, a zero instance count, or binding 9 never reaching the
+//!   vertex shader. The placement itself is checked on the CPU in `boids-scene`.
 //!
 //! Run as a hand-rolled main: the device must be created and dropped on the main thread, for the reason
 //! documented in `boids-gpu/tests/gpu/main.rs`.
@@ -29,14 +32,16 @@ mod common;
 
 use std::time::Instant;
 
-use boids_core::config::SimConfig;
 use boids_core::camera::OrbitCamera;
-use boids_core::layout::{InteractionMode, InteractionUniforms, PostParams, SceneUniform, SimMode, WaterParams};
+use boids_core::config::SimConfig;
+use boids_core::layout::{
+    InteractionMode, InteractionUniforms, PostParams, SceneUniform, SimMode, WaterParams,
+};
 use boids_gpu::context::GpuContext;
 use boids_gpu::sim::{SimPipelines, SimResources, Strategy};
 use boids_render::renderer::{FrameInput, Renderer};
 use boids_render::targets::DEPTH_FORMAT;
-use boids_render::SceneBinding;
+use boids_render::{Model, SceneBinding};
 use common::{COLOR_FORMAT, HEIGHT, WIDTH};
 use glam::{Vec2, Vec3};
 
@@ -71,13 +76,21 @@ fn main() {
         ctx.info.name,
         ctx.info.backend,
         ctx.info.device_type,
-        if common::is_software(&ctx) { " [SOFTWARE]" } else { "" }
+        if common::is_software(&ctx) {
+            " [SOFTWARE]"
+        } else {
+            ""
+        }
     );
     println!("target: {WIDTH}x{HEIGHT} {COLOR_FORMAT:?}\n");
 
     let cases: Vec<NamedCheck> = vec![
         ("background_has_structure", background_has_structure),
-        ("terrain_grounds_the_sky_world", terrain_grounds_the_sky_world),
+        (
+            "terrain_grounds_the_sky_world",
+            terrain_grounds_the_sky_world,
+        ),
+        ("landmark_is_drawn", landmark_is_drawn),
         ("agents_contribute_pixels", agents_contribute_pixels),
         ("depth_is_written", depth_is_written),
         ("worlds_look_different", worlds_look_different),
@@ -111,7 +124,10 @@ fn main() {
         }
     }
 
-    println!("{passed} passed, {skipped} skipped, {} failed", failures.len());
+    println!(
+        "{passed} passed, {skipped} skipped, {} failed",
+        failures.len()
+    );
     drop(ctx);
     if failures.is_empty() {
         return;
@@ -148,7 +164,11 @@ impl Captured {
             .0
             .iter()
             .zip(other.color.as_chunks::<4>().0.iter())
-            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > threshold))
+            .filter(|(a, b)| {
+                a.iter()
+                    .zip(b.iter())
+                    .any(|(x, y)| x.abs_diff(*y) > threshold)
+            })
             .count()
     }
 
@@ -341,8 +361,12 @@ impl<'a> Harness<'a> {
             self.config.r_percept,
         );
 
-        let color_view = self.color.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth_view = self.depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_view = self
+            .color
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = self
+            .depth
+            .create_view(&wgpu::TextureViewDescriptor::default());
         self.renderer.render_into(
             self.ctx,
             &color_view,
@@ -362,6 +386,21 @@ impl<'a> Harness<'a> {
         let color = read_color(self.ctx, &self.color);
         let depth = read_depth(self.ctx, &self.depth);
         Captured { color, depth }
+    }
+
+    /// Draws one model in the viewer's studio and reads the colour target back.
+    ///
+    /// The same `render_model` the interactive viewer and `--model` use, into the same off-screen
+    /// target, so a model checked here is the model the app shows. No depth is read: the studio has
+    /// nothing behind the model to test against, so the attachment is written and discarded.
+    fn capture_model(&mut self, model: Model, camera: &OrbitCamera) -> Captured {
+        let color_view = self
+            .color
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer
+            .render_model(self.ctx, &color_view, model, camera, 0.0);
+        let color = read_color(self.ctx, &self.color);
+        Captured { color, depth: None }
     }
 }
 
@@ -482,8 +521,13 @@ fn luma(p: [u8; 4]) -> u32 {
 /// horizon from both sides rather than assuming a position. That independence matters: with the
 /// default orbit pitch the horizon sits near the top of the frame, and a check that assumed otherwise
 /// would be testing the camera, not the shader.
+///
+/// It samples a column off the frame's centre, not the centre itself: the landmark is placed at the
+/// world's centre, so the middle column is castle wall rather than background, and a sky check that
+/// read a battlement would fail for the wrong reason.
 fn background_has_structure(ctx: &GpuContext) -> CheckResult {
     let mut harness = Harness::new(ctx, SimMode::Birds, 64);
+    let column = WIDTH / 4;
 
     // Looking down: the frame is mostly ground, with sky only above the horizon near the top.
     harness.camera.pitch = 0.6;
@@ -495,8 +539,8 @@ fn background_has_structure(ctx: &GpuContext) -> CheckResult {
              the background pass is not running, or every pixel is the same colour"
         ));
     }
-    let top = looking_down.pixel(WIDTH / 2, 2);
-    let bottom = looking_down.pixel(WIDTH / 2, HEIGHT - 2);
+    let top = looking_down.pixel(column, 2);
+    let bottom = looking_down.pixel(column, HEIGHT - 2);
     if luma(top) <= luma(bottom) {
         return Err(format!(
             "looking down, the top of the frame ({top:?}, luma {}) should be brighter than the \
@@ -510,8 +554,8 @@ fn background_has_structure(ctx: &GpuContext) -> CheckResult {
     // Looking up: the frame is mostly sky, and the zenith above must be darker than the horizon below.
     harness.camera.pitch = -0.6;
     let looking_up = harness.capture(0, 64);
-    let zenith = looking_up.pixel(WIDTH / 2, 2);
-    let near_horizon = looking_up.pixel(WIDTH / 2, HEIGHT - 2);
+    let zenith = looking_up.pixel(column, 2);
+    let near_horizon = looking_up.pixel(column, HEIGHT - 2);
     if luma(zenith) >= luma(near_horizon) {
         return Err(format!(
             "looking up, the zenith at the top of the frame ({zenith:?}, luma {}) should be darker \
@@ -569,6 +613,52 @@ fn terrain_grounds_the_sky_world(ctx: &GpuContext) -> CheckResult {
     }
     println!(
         "\n    ground covers the lower frame (sky through it {:.1}%)",
+        fraction * 100.0
+    );
+    Ok(Outcome::Pass)
+}
+
+/// The castle has to be drawn, not only placed.
+///
+/// The placement is a CPU search over the terrain and the reef, checked in `boids-scene`. What no CPU
+/// test can see is whether the landmark pass turns that placement into geometry: a mesh builder that
+/// returns nothing, a zero instance count, a winding culled to nothing, or binding 9 never reaching
+/// the vertex shader would each leave a frame with no castle in it while every other check stayed
+/// green. The viewer's studio isolates the pass - the castle is the only thing drawn against a flat
+/// background - and comparing two framings of it fails for exactly one reason: a pass that draws
+/// nothing produces two identical frames.
+fn landmark_is_drawn(ctx: &GpuContext) -> CheckResult {
+    let mut harness = Harness::new(ctx, SimMode::Birds, 64);
+    let framed = |distance: f32| OrbitCamera {
+        target: Model::Castle.target(),
+        distance,
+        yaw: 0.7,
+        pitch: Model::Castle.pitch(),
+        fov_y: 45f32.to_radians(),
+        near: 0.02,
+        far: 100.0,
+        aspect: WIDTH as f32 / HEIGHT as f32,
+    };
+    // Two distances: the silhouette is a different size, so a pass that draws the mesh changes many
+    // pixels and a pass that draws nothing changes none. The post chain is screen-space, so the
+    // background, its vignette and its grain are identical between the two and cancel.
+    let near = harness.capture_model(Model::Castle, &framed(Model::Castle.distance() * 0.8));
+    let far = harness.capture_model(Model::Castle, &framed(Model::Castle.distance() * 1.2));
+
+    let differing = near.differing_pixels(&far, 6);
+    let fraction = differing as f32 / (WIDTH * HEIGHT) as f32;
+    if fraction < 0.01 {
+        return Err(format!(
+            "only {differing} of {} pixels changed when the castle was reframed ({:.3}%); the \
+             landmark pass draws no geometry. Check `castle_mesh` in boids-scene/src/mesh.rs, the \
+             instance count from `LandmarkGpu::upload`, and that binding 9 reaches the vertex shader \
+             in render/landmark.wgsl.",
+            WIDTH * HEIGHT,
+            fraction * 100.0
+        ));
+    }
+    println!(
+        "\n    reframing the castle changed {differing} pixels ({:.2}%)",
         fraction * 100.0
     );
     Ok(Outcome::Pass)
@@ -679,10 +769,12 @@ fn worlds_look_different(ctx: &GpuContext) -> CheckResult {
             fraction * 100.0
         ));
     }
-    println!("\n    {:.1}% of pixels differ between sky and sea", fraction * 100.0);
+    println!(
+        "\n    {:.1}% of pixels differ between sky and sea",
+        fraction * 100.0
+    );
     Ok(Outcome::Pass)
 }
-
 
 // -------------------------------------------------------------------------------------------
 // HDR pass checks

@@ -522,12 +522,12 @@ pub struct SkyParams {
 
 /// One scattered tree: a base position, an orientation and a variant.
 ///
-/// Mirrored in WGSL as `TreeInstance`. 32 bytes so the array stride stays a multiple of 16. This is
+/// Mirrored in WGSL as `StaticInstance`. 32 bytes so the array stride stays a multiple of 16. This is
 /// a storage element rather than a uniform: the scatter pass appends to an array of them and the
 /// tree pass draws however many were accepted.
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
-pub struct TreeInstance {
+pub struct StaticInstance {
     /// Base position, on the ground, metres.
     pub pos: [f32; 3],
     /// Uniform scale.
@@ -610,8 +610,8 @@ const _: () = {
     assert!(core::mem::size_of::<SkyParams>() == 48);
     assert!(core::mem::align_of::<SkyParams>() == 16);
 
-    assert!(core::mem::size_of::<TreeInstance>() == 32);
-    assert!(core::mem::align_of::<TreeInstance>() == 16);
+    assert!(core::mem::size_of::<StaticInstance>() == 32);
+    assert!(core::mem::align_of::<StaticInstance>() == 16);
 };
 
 /// Field offsets of every GPU struct, as the host sees them.

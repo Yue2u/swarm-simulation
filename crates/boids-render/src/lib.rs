@@ -32,6 +32,7 @@
 
 pub mod background;
 pub mod boid_pass;
+pub mod landmark;
 pub mod ocean;
 pub mod png;
 pub mod post;
@@ -41,9 +42,12 @@ pub mod scene;
 pub mod targets;
 pub mod terrain;
 pub mod tree;
+pub mod viewer;
 
+pub use landmark::LandmarkPass;
 pub use renderer::{FrameInput, FrameStats, Renderer};
 pub use scene::{SceneBinding, SceneLayout};
+pub use targets::{FrameTargets, DEPTH_FORMAT, HDR_FORMAT};
 pub use terrain::TerrainPass;
 pub use tree::TreePass;
-pub use targets::{FrameTargets, DEPTH_FORMAT, HDR_FORMAT};
+pub use viewer::{Model, ModelViewer};

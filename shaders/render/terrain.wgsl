@@ -3,7 +3,7 @@
 //
 // bindings: @group(0) 0:SceneUniform(uniform) 1:array<Boid>(storage, read) 2:WaterParams(uniform)
 //                     3:InteractionUniforms(uniform) 4:PostParams(uniform) 5:TerrainParams(uniform)
-//                     6:heightfield(texture_2d<f32>, read) 7:array<TreeInstance>(storage, read)
+//                     6:heightfield(texture_2d<f32>, read) 7:array<StaticInstance>(storage, read)
 //                     8:SkyParams(uniform)
 // draw:     draw(0..segments^2 * 2 * 3, 0..1)
 // depth:    compare LessEqual, write enabled. Drawn after the backdrop (which writes no depth) and

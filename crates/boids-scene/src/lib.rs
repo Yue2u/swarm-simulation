@@ -13,18 +13,20 @@
 //! * `boids-render` owns the passes, and asks this crate for the numbers they need.
 //!
 //! Today that is [`water`] (the underwater medium and the post-processing grade), [`sky`] (the
-//! atmosphere) and [`terrain`] (the sky world's ground, its baked heightfield and the meshes that go
-//! on it).
+//! atmosphere), [`terrain`] (the sky world's ground, its baked heightfield and the meshes that go on
+//! it) and [`landmark`] (the castle, placed on the terrain or on the seafloor).
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations)]
 
+pub mod landmark;
 pub mod mesh;
 pub mod sky;
 pub mod terrain;
 pub mod water;
 
-pub use mesh::{tree_mesh, TreeMesh, TreeVertex};
+pub use landmark::{castle_instance, LandmarkGpu};
+pub use mesh::{castle_mesh, tree_mesh, MeshVertex, StaticMesh};
 pub use sky::sky_params;
 pub use terrain::{map_resolution, mesh_segments, terrain_params, TerrainGpu};
 pub use water::{post_params, water_params};
